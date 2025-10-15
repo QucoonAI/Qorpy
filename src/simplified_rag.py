@@ -107,7 +107,8 @@ class SimplifiedRAG:
             logger.error(f"Error retrieving PDF from S3: {e}")
             return None
     
-    def _create_chunks(self, pages: List[Dict], chunk_size: int = 200, overlap_percent: float = 0.1) -> List[Dict[str, Any]]:
+    
+    def _create_chunks(self, pages: List[Dict], chunk_size: int = 2000 , overlap_percent: float = 0.1) -> List[Dict[str, Any]]:
         """Create overlapping chunks from pages with metadata"""
         chunks = []
         overlap_tokens = int(chunk_size * overlap_percent)
