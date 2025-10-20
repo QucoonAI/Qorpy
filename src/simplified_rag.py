@@ -31,9 +31,12 @@ load_dotenv()
 aws_region = "us-east-1" 
 S3_BUCKET = os.getenv("S3_BUCKET_NAME", "simplified-rag-app")
 s3_client = boto3.client('s3', region_name=aws_region)
-
 class SimplifiedRAG:
     """Simplified RAG system with 4 core functions for backend integration"""
+    
+    # Class-level constants
+    CHUNK_SIZE = 2000
+    CHUNK_OVERLAP_PERCENT = 0.2
     
     def __init__(self):
         """Initialize the RAG system with AWS Bedrock and Pinecone"""
@@ -108,29 +111,7 @@ class SimplifiedRAG:
             return None
     
     
-    def _create_chunks(self, pages: List[Dict], chunk_size: int = 2000 , overlap_percent: float = 0.1) -> List[Dict[str, Any]]:
-        """Create overlapping chunks from pages with metadata"""
-        chunks = []
-        overlap_tokens = int(chunk_size * overlap_percent)
-        
-        for page in pages:
-            text = page['text']
-            tokens = self.tokenizer.encode(text)
-            
-            # Create chunks for this page
-            for i in range(0, len(tokens), chunk_size - overlap_tokens):
-                chunk_tokens = tokens[i:i + chunk_size]
-                chunk_text = self.tokenizer.decode(chunk_tokens)
-                
-                chunks.append({
-                    'text': chunk_text,
-                    'page_number': page['page_number'],
-                    'token_count': len(chunk_tokens),
-                    'char_count': len(chunk_text),
-                    'chunk_index': len(chunks)
-                })
-        
-        return chunks
+
     
     def _generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings using AWS Bedrock Titan"""
@@ -204,8 +185,63 @@ class SimplifiedRAG:
     # CORE FUNCTIONS
     # =================
     
-    def _function_1_process_complete_document(self, filename: str, 
-                                           chunk_size: int = 200) -> Dict[str, Any]:
+    def _create_chunks(self, pages: List[Dict]) -> List[Dict[str, Any]]:
+        """Recursively chunk text into overlapping, semantically-coherent chunks."""
+        chunks = []
+        chunk_size = self.CHUNK_SIZE
+        overlap_tokens = int(chunk_size * self.CHUNK_OVERLAP_PERCENT)
+
+        def recursive_chunk(text: str, page_number: int):
+            tokens = self.tokenizer.encode(text)
+            
+            # Base case: text fits within chunk_size
+            if len(tokens) <= chunk_size:
+                chunks.append({
+                    'text': text,
+                    'page_number': page_number,
+                    'token_count': len(tokens),
+                    'char_count': len(text),
+                    'chunk_index': len(chunks)
+                })
+                return
+
+            # Try to split at a semantic boundary (e.g., sentence or paragraph)
+            midpoint = chunk_size - overlap_tokens
+            decoded_text = self.tokenizer.decode(tokens[:midpoint])
+            
+            # Split at nearest sentence or paragraph end
+            split_point = max(
+                decoded_text.rfind('. '),
+                decoded_text.rfind('\n'),
+                decoded_text.rfind('? '),
+                decoded_text.rfind('! ')
+            )
+            if split_point == -1 or split_point < chunk_size * 0.5:
+                split_point = midpoint  # fallback to raw token split
+
+            first_chunk = decoded_text[:split_point].strip()
+            remaining_text = self.tokenizer.decode(tokens[split_point - overlap_tokens:]).strip()
+
+            # Add first chunk
+            chunks.append({
+                'text': first_chunk,
+                'page_number': page_number,
+                'token_count': len(self.tokenizer.encode(first_chunk)),
+                'char_count': len(first_chunk),
+                'chunk_index': len(chunks)
+            })
+
+            # Recurse on remaining text
+            if remaining_text:
+                recursive_chunk(remaining_text, page_number)
+
+        for page in pages:
+            recursive_chunk(page['text'], page['page_number'])
+
+        return chunks
+
+
+    def _function_1_process_complete_document(self, filename: str) -> Dict[str, Any]:
         """
         FUNCTION 1: Complete PDF Processing Pipeline
         
@@ -213,9 +249,7 @@ class SimplifiedRAG:
         Perfect for backend developers - one call does everything.
         
         Args:
-            pdf_path: Path to PDF file
-            document_name: Optional custom name (defaults to filename)
-            chunk_size: Chunk size in tokens (default 200)
+            filename: Name of the PDF file in S3
             
         Returns:
             Dict with processing results and metadata for backend tracking
@@ -244,7 +278,7 @@ class SimplifiedRAG:
             
             # Step 2: Create chunks
             print("✂️ Creating chunks...")
-            chunks = self._create_chunks(pages, chunk_size)
+            chunks = self._create_chunks(pages)
             total_chunks = len(chunks)
             
             # Step 3: Generate embeddings
@@ -269,7 +303,7 @@ class SimplifiedRAG:
                 'total_pages': total_pages,
                 'total_chunks': total_chunks,
                 'total_tokens': total_tokens,
-                'chunk_size_used': chunk_size,
+                'chunk_size_used': self.CHUNK_SIZE,
                 'avg_chunk_length': round(avg_chunk_length, 1),
                 'pinecone_vectors_uploaded': upload_result['vectors_uploaded'],
                 'created_at': upload_result['timestamp'],
@@ -289,9 +323,8 @@ class SimplifiedRAG:
                 'document_id': None,
                 'processing_time_seconds': time.time() - start_time
             }
-    
-    def function_2_add_to_existing_collection(self, document_name: str, 
-                                            chunk_size: int = 200) -> Dict[str, Any]:
+
+    def function_2_add_to_existing_collection(self, document_name: str) -> Dict[str, Any]:
         """
         FUNCTION 2: Add Document to Existing Collection
         
@@ -299,9 +332,7 @@ class SimplifiedRAG:
         Perfect for expanding your knowledge base.
         
         Args:
-            pdf_path: Path to PDF file
-            document_name: Optional custom name
-            chunk_size: Chunk size in tokens
+            document_name: Name of the document
             
         Returns:
             Dict with processing results
@@ -313,7 +344,7 @@ class SimplifiedRAG:
         initial_vector_count = stats['total_vector_count']
         
         # Process the document (same as function 1)
-        result = self._function_1_process_complete_document( document_name, chunk_size)
+        result = self._function_1_process_complete_document(document_name)
         
         if result['success']:
             # Update result with collection info
@@ -327,9 +358,8 @@ class SimplifiedRAG:
             print(f"✅ Document added! Collection now has {new_stats['total_vector_count']} total vectors")
         
         return result
-    
-    def function_3_replace_entire_database(self, document_name: str, 
-                                         chunk_size: int = 200) -> Dict[str, Any]:
+
+    def function_3_replace_entire_database(self, document_name: str) -> Dict[str, Any]:
         """
         FUNCTION 3: Replace Entire Database
         
@@ -337,9 +367,7 @@ class SimplifiedRAG:
         Use with caution - this wipes everything!
         
         Args:
-            pdf_path: Path to PDF file
-            document_name: Optional custom name
-            chunk_size: Chunk size in tokens
+            document_name: Name of the document
             
         Returns:
             Dict with processing results
@@ -359,7 +387,7 @@ class SimplifiedRAG:
             print("🗑️ Database cleared!")
             
             # Process new document
-            result = self._function_1_process_complete_document( document_name, chunk_size)
+            result = self._function_1_process_complete_document(document_name)
             
             if result['success']:
                 result['database_replacement_info'] = {
