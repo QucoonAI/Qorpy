@@ -33,11 +33,7 @@ S3_BUCKET = os.getenv("S3_BUCKET_NAME", "simplified-rag-app")
 s3_client = boto3.client('s3', region_name=aws_region)
 class SimplifiedRAG:
     """Simplified RAG system with 4 core functions for backend integration"""
-    
-    # Class-level constants
-    CHUNK_SIZE = 2000
-    CHUNK_OVERLAP_PERCENT = 0.2
-    
+        
     def __init__(self):
         """Initialize the RAG system with AWS Bedrock and Pinecone"""
         # AWS Bedrock setup
@@ -47,7 +43,9 @@ class SimplifiedRAG:
             aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
         )
-        
+        self.CHUNK_SIZE = 2000
+        self.CHUNK_OVERLAP_PERCENT = 0.2
+
         # Pinecone setup
         pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
         self.index_name = "rag-documents"
@@ -188,14 +186,13 @@ class SimplifiedRAG:
     def _create_chunks(self, pages: List[Dict]) -> List[Dict[str, Any]]:
         """Recursively chunk text into overlapping, semantically-coherent chunks."""
         chunks = []
-        chunk_size = self.CHUNK_SIZE
-        overlap_tokens = int(chunk_size * self.CHUNK_OVERLAP_PERCENT)
+        overlap_tokens = int(self.CHUNK_SIZE * self.CHUNK_OVERLAP_PERCENT)
 
         def recursive_chunk(text: str, page_number: int):
             tokens = self.tokenizer.encode(text)
             
             # Base case: text fits within chunk_size
-            if len(tokens) <= chunk_size:
+            if len(tokens) <= self.CHUNK_SIZE:
                 chunks.append({
                     'text': text,
                     'page_number': page_number,
@@ -206,7 +203,7 @@ class SimplifiedRAG:
                 return
 
             # Try to split at a semantic boundary (e.g., sentence or paragraph)
-            midpoint = chunk_size - overlap_tokens
+            midpoint = self.CHUNK_SIZE - overlap_tokens
             decoded_text = self.tokenizer.decode(tokens[:midpoint])
             
             # Split at nearest sentence or paragraph end
@@ -216,7 +213,7 @@ class SimplifiedRAG:
                 decoded_text.rfind('? '),
                 decoded_text.rfind('! ')
             )
-            if split_point == -1 or split_point < chunk_size * 0.5:
+            if split_point == -1 or split_point < self.CHUNK_SIZE * 0.5:
                 split_point = midpoint  # fallback to raw token split
 
             first_chunk = decoded_text[:split_point].strip()
