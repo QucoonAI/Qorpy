@@ -12,7 +12,7 @@ Perfect for backend developers - clean, simple API
 import os
 import uuid
 import time
-import logging
+import logging  # Import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 import boto3
@@ -24,60 +24,73 @@ from dotenv import load_dotenv
 from fastapi import HTTPException
 
 
+# Use the logger initialized in the main app module or configure one here
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
-aws_region = "us-east-1" 
-S3_BUCKET = os.getenv("S3_BUCKET_NAME", "simplified-rag-app")
-s3_client = boto3.client('s3', region_name=aws_region)
+aws_region = "us-east-1"  # Define AWS region
+S3_BUCKET = os.getenv("S3_BUCKET_NAME", "simplified-rag-app")  # Get S3 bucket from env
+s3_client = boto3.client('s3', region_name=aws_region)  # Initialize Boto3 S3 client
+
 class SimplifiedRAG:
     """Simplified RAG system with 4 core functions for backend integration"""
         
     def __init__(self):
         """Initialize the RAG system with AWS Bedrock and Pinecone"""
-        # AWS Bedrock setup
-        self.bedrock = boto3.client(
-            'bedrock-runtime',
-            region_name='us-east-1',
-            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-        )
-        self.CHUNK_SIZE = 2000
-        self.CHUNK_OVERLAP_PERCENT = 0.2
-
-        # Pinecone setup
-        pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
-        self.index_name = "rag-documents"
-        
-        # Create index if it doesn't exist
-        if self.index_name not in [index.name for index in pc.list_indexes()]:
-            pc.create_index(
-                name=self.index_name,
-                dimension=1024,  # Titan v2 embedding dimension
-                metric='cosine',
-                spec=ServerlessSpec(cloud='aws', region='us-east-1')
+        try:
+            # AWS Bedrock setup
+            self.bedrock = boto3.client(
+                'bedrock-runtime',
+                region_name='us-east-1',
+                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
             )
-        
-        self.index = pc.Index(self.index_name)
-        
-        # Model configurations
-        self.embedding_model = "amazon.titan-embed-text-v2:0"
-        self.chat_model = "anthropic.claude-3-5-sonnet-20240620-v1:0"
-        
-        # Tokenizer for chunking
-        self.tokenizer = tiktoken.get_encoding("cl100k_base")
-        
-        print("✅ Simplified RAG system initialized successfully!")
+            # Configuration for chunking
+            self.CHUNK_SIZE = 2000  # Target size in tokens
+            self.CHUNK_OVERLAP_PERCENT = 0.2  # 20% overlap
+
+            # Pinecone setup
+            pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+            self.index_name = "rag-documents"
+            
+            # Create index if it doesn't exist
+            if self.index_name not in [index.name for index in pc.list_indexes()]:
+                logger.info(f"Creating new Pinecone index: {self.index_name}")
+                pc.create_index(
+                    name=self.index_name,
+                    dimension=1024,  # Titan v2 embedding dimension
+                    metric='cosine',
+                    spec=ServerlessSpec(cloud='aws', region='us-east-1')
+                )
+            
+            # Connect to the Pinecone index
+            self.index = pc.Index(self.index_name)
+            
+            # Model configurations
+            self.embedding_model = "amazon.titan-embed-text-v2:0"  # Embedding model
+            self.chat_model = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # LLM
+            
+            # Tokenizer for chunking (matches Claude models)
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            
+            logger.info("✅ Simplified RAG system initialized successfully!") # Changed from print
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize SimplifiedRAG: {e}", exc_info=True)
+            raise  # Re-raise exception to stop application startup if init fails
     
     def _extract_pdf_text(self, file_bytes: bytes) -> List[Dict[str, Any]]:
         """Extract text from PDF with page metadata"""
         try:
+            # Create a PdfReader object from the in-memory file bytes
             reader = PdfReader(BytesIO(file_bytes))
             pages = []
             
+            # Iterate through each page in the PDF
             for page_num, page in enumerate(reader.pages, 1):
-                text = page.extract_text().strip()
+                text = page.extract_text().strip()  # Extract and clean text
+                
+                # Only add pages that contain text
                 if text:
                     pages.append({
                         'page_number': page_num,
@@ -85,27 +98,36 @@ class SimplifiedRAG:
                         'char_count': len(text)
                     })
             
+            logger.info(f"Extracted {len(pages)} pages with text from PDF.")
             return pages
             
         except Exception as e:
+            logger.error(f"Failed to extract PDF text: {e}", exc_info=True)
+            # Propagate the error to be caught by the calling function
             raise Exception(f"Failed to extract PDF text: {str(e)}")
 
 
     def _get_s3_file_content(self, response, S3_BUCKET: str) -> bytes | None:
         """Retrieve the first PDF file from S3 and return its bytes."""
         try:
+            # Loop through the files listed in the S3 response
             for obj in response.get("Contents", []):
                 key = obj["Key"]
+                # Find the first file that ends with .pdf
                 if key.lower().endswith(".pdf"):
-                    logger.info(f"Fetching PDF from S3: {key}")
+                    logger.info(f"Fetching PDF from S3: s3://{S3_BUCKET}/{key}")
+                    # Get the file object from S3
                     file_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+                    # Read the file's content into bytes and return it
                     return file_obj["Body"].read()  # return bytes immediately
 
+            # If no PDF file is found
             logger.warning("No PDF files found in S3 response.")
             return None
 
         except Exception as e:
-            logger.error(f"Error retrieving PDF from S3: {e}")
+            # Log any error during S3 retrieval
+            logger.error(f"Error retrieving PDF from S3: {e}", exc_info=True)
             return None
     
     
@@ -115,69 +137,88 @@ class SimplifiedRAG:
         """Generate embeddings using AWS Bedrock Titan"""
         embeddings = []
         
+        # Iterate over each text chunk
         for text in texts:
             try:
-                import json
+                import json  # Kept local as in original
+                # Format the request body for Bedrock Titan
                 request_body = json.dumps({"inputText": text})
                 
+                # Invoke the Bedrock model
                 response = self.bedrock.invoke_model(
                     modelId=self.embedding_model,
                     body=request_body,
                     contentType='application/json'
                 )
                 
-                import json
+                import json  # Kept local as in original
+                # Parse the response
                 result = json.loads(response['body'].read())
+                # Append the resulting embedding vector
                 embeddings.append(result['embedding'])
                 
             except Exception as e:
-                print(f"⚠️ Warning: Failed to generate embedding for text: {str(e)}")
-                # Use zero vector as fallback
+                # Log a warning and append a zero vector as a fallback
+                logger.warning(f"Failed to generate embedding for text chunk: {str(e)}")
+                # Use zero vector as fallback to avoid dimension mismatch
                 embeddings.append([0.0] * 1024)
         
+        logger.info(f"Generated {len(embeddings)} embeddings.")
         return embeddings
     
     def _upload_to_pinecone(self, chunks: List[Dict], embeddings: List[List[float]], 
-                           document_id: str, filename: str) -> Dict[str, Any]:
+                            document_id: str, filename: str) -> Dict[str, Any]:
         """Upload chunks and embeddings to Pinecone with rich metadata"""
-        vectors = []
-        timestamp = datetime.now().isoformat()
-        
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            vector_id = f"{document_id}_chunk_{i}"
+        try:
+            vectors = []
+            timestamp = datetime.now().isoformat()  # Get current timestamp
             
-            metadata = {
+            # Prepare vectors for upload
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                vector_id = f"{document_id}_chunk_{i}"  # Create a unique ID for each chunk
+                
+                # Create a rich metadata object
+                metadata = {
+                    'document_id': document_id,
+                    'filename': filename,
+                    'page_number': chunk['page_number'],
+                    'chunk_index': chunk['chunk_index'],
+                    'text': chunk['text'][:1000],  # Truncate text for metadata
+                    'token_count': chunk['token_count'],
+                    'char_count': chunk['char_count'],
+                    'created_at': timestamp,
+                    'chunk_type': 'text'  # For potential future use
+                }
+                
+                # Append the final vector object
+                vectors.append({
+                    'id': vector_id,
+                    'values': embedding,
+                    'metadata': metadata
+                })
+            
+            # Upload in batches for efficiency and reliability
+            batch_size = 100
+            total_uploaded = 0
+            
+            logger.info(f"Uploading {len(vectors)} vectors in batches of {batch_size}...")
+            
+            for i in range(0, len(vectors), batch_size):
+                batch = vectors[i:i + batch_size]
+                self.index.upsert(vectors=batch)  # Upsert batch to Pinecone
+                total_uploaded += len(batch)
+            
+            logger.info(f"Successfully uploaded {total_uploaded} vectors to Pinecone.")
+            
+            # Return a summary of the upload
+            return {
+                'vectors_uploaded': total_uploaded,
                 'document_id': document_id,
-                'filename': filename,
-                'page_number': chunk['page_number'],
-                'chunk_index': chunk['chunk_index'],
-                'text': chunk['text'][:1000],  # Limit text in metadata
-                'token_count': chunk['token_count'],
-                'char_count': chunk['char_count'],
-                'created_at': timestamp,
-                'chunk_type': 'text'
+                'timestamp': timestamp
             }
-            
-            vectors.append({
-                'id': vector_id,
-                'values': embedding,
-                'metadata': metadata
-            })
-        
-        # Upload in batches
-        batch_size = 100
-        total_uploaded = 0
-        
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
-            self.index.upsert(vectors=batch)
-            total_uploaded += len(batch)
-        
-        return {
-            'vectors_uploaded': total_uploaded,
-            'document_id': document_id,
-            'timestamp': timestamp
-        }
+        except Exception as e:
+            logger.error(f"Failed to upload vectors to Pinecone: {e}", exc_info=True)
+            raise Exception(f"Pinecone upload failed: {str(e)}") # Propagate error
     
     # =================
     # CORE FUNCTIONS
@@ -185,57 +226,69 @@ class SimplifiedRAG:
     
     def _create_chunks(self, pages: List[Dict]) -> List[Dict[str, Any]]:
         """Recursively chunk text into overlapping, semantically-coherent chunks."""
-        chunks = []
-        overlap_tokens = int(self.CHUNK_SIZE * self.CHUNK_OVERLAP_PERCENT)
+        try:
+            chunks = []
+            overlap_tokens = int(self.CHUNK_SIZE * self.CHUNK_OVERLAP_PERCENT)
 
-        def recursive_chunk(text: str, page_number: int):
-            tokens = self.tokenizer.encode(text)
-            
-            # Base case: text fits within chunk_size
-            if len(tokens) <= self.CHUNK_SIZE:
+            def recursive_chunk(text: str, page_number: int):
+                """Nested helper function to recursively chunk text."""
+                tokens = self.tokenizer.encode(text)
+                
+                # Base case: text fits within chunk_size
+                if len(tokens) <= self.CHUNK_SIZE:
+                    chunks.append({
+                        'text': text,
+                        'page_number': page_number,
+                        'token_count': len(tokens),
+                        'char_count': len(text),
+                        'chunk_index': len(chunks)  # Index based on total chunks
+                    })
+                    return
+
+                # Recursive case: text is too long and needs splitting
+                # Try to split at a semantic boundary (e.g., sentence or paragraph)
+                midpoint = self.CHUNK_SIZE - overlap_tokens
+                decoded_text = self.tokenizer.decode(tokens[:midpoint])
+                
+                # Find the best split point (sentence end, newline, etc.)
+                split_point = max(
+                    decoded_text.rfind('. '),
+                    decoded_text.rfind('\n'),
+                    decoded_text.rfind('? '),
+                    decoded_text.rfind('! ')
+                )
+                
+                # Fallback to raw token split if no good semantic split is found
+                if split_point == -1 or split_point < self.CHUNK_SIZE * 0.5:
+                    split_point = midpoint  # fallback to raw token split
+
+                # Create the first chunk
+                first_chunk = decoded_text[:split_point].strip()
+                # Create the remaining text with overlap
+                remaining_text = self.tokenizer.decode(tokens[split_point - overlap_tokens:]).strip()
+
+                # Add first chunk to the list
                 chunks.append({
-                    'text': text,
+                    'text': first_chunk,
                     'page_number': page_number,
-                    'token_count': len(tokens),
-                    'char_count': len(text),
+                    'token_count': len(self.tokenizer.encode(first_chunk)),
+                    'char_count': len(first_chunk),
                     'chunk_index': len(chunks)
                 })
-                return
 
-            # Try to split at a semantic boundary (e.g., sentence or paragraph)
-            midpoint = self.CHUNK_SIZE - overlap_tokens
-            decoded_text = self.tokenizer.decode(tokens[:midpoint])
+                # Recurse on remaining text
+                if remaining_text:
+                    recursive_chunk(remaining_text, page_number)
+
+            # Iterate over all pages and chunk their text
+            for page in pages:
+                recursive_chunk(page['text'], page['page_number'])
             
-            # Split at nearest sentence or paragraph end
-            split_point = max(
-                decoded_text.rfind('. '),
-                decoded_text.rfind('\n'),
-                decoded_text.rfind('? '),
-                decoded_text.rfind('! ')
-            )
-            if split_point == -1 or split_point < self.CHUNK_SIZE * 0.5:
-                split_point = midpoint  # fallback to raw token split
-
-            first_chunk = decoded_text[:split_point].strip()
-            remaining_text = self.tokenizer.decode(tokens[split_point - overlap_tokens:]).strip()
-
-            # Add first chunk
-            chunks.append({
-                'text': first_chunk,
-                'page_number': page_number,
-                'token_count': len(self.tokenizer.encode(first_chunk)),
-                'char_count': len(first_chunk),
-                'chunk_index': len(chunks)
-            })
-
-            # Recurse on remaining text
-            if remaining_text:
-                recursive_chunk(remaining_text, page_number)
-
-        for page in pages:
-            recursive_chunk(page['text'], page['page_number'])
-
-        return chunks
+            logger.info(f"Created {len(chunks)} chunks from {len(pages)} pages.")
+            return chunks
+        except Exception as e:
+            logger.error(f"Failed during text chunking: {e}", exc_info=True)
+            raise Exception(f"Chunking failed: {str(e)}") # Propagate error
 
 
     def _function_1_process_complete_document(self, filename: str) -> Dict[str, Any]:
@@ -255,36 +308,42 @@ class SimplifiedRAG:
         
         try:
             # Generate document ID and name
-            document_id = str(uuid.uuid4())
+            document_id = str(uuid.uuid4())  # Unique ID for this document
             
-            print(f"🚀 Processing document: {filename}")
+            logger.info(f"🚀 Processing document: {filename} (ID: {document_id})")
             
             # Step 1: Extract PDF text
-            print("📄 Extracting file bytes...")
+            logger.info("📄 Extracting file bytes from S3...")
+            # Find the file in S3
             response = s3_client.list_objects_v2(
                 Bucket=S3_BUCKET,
                 Prefix=f"{filename.lower().replace(' ', '_')}.pdf"
             )
             
+            # Handle file not found
             if 'Contents' not in response:
+                logger.error(f"File not found in S3 for: {filename}")
                 raise HTTPException(status_code=404, detail="No files found for the specified company")
             
+            # Get file content and extract text
             file_bytes = self._get_s3_file_content(response, S3_BUCKET)
             pages = self._extract_pdf_text(file_bytes) #type: ignore
             total_pages = len(pages)
             
             # Step 2: Create chunks
-            print("✂️ Creating chunks...")
+            logger.info("✂️ Creating chunks...")
             chunks = self._create_chunks(pages)
             total_chunks = len(chunks)
+            if total_chunks == 0:
+                raise Exception("No text chunks were created from the PDF.")
             
             # Step 3: Generate embeddings
-            print("🧠 Generating embeddings...")
+            logger.info("🧠 Generating embeddings...")
             chunk_texts = [chunk['text'] for chunk in chunks]
             embeddings = self._generate_embeddings(chunk_texts)
             
             # Step 4: Upload to Pinecone
-            print("📤 Uploading to Pinecone...")
+            logger.info("📤 Uploading to Pinecone...")
             upload_result = self._upload_to_pinecone(chunks, embeddings, document_id, filename)
             
             # Calculate processing time and statistics
@@ -292,6 +351,7 @@ class SimplifiedRAG:
             avg_chunk_length = sum(chunk['char_count'] for chunk in chunks) / len(chunks)
             total_tokens = sum(chunk['token_count'] for chunk in chunks)
             
+            # Prepare success response
             result = {
                 'success': True,
                 'document_id': document_id,
@@ -310,15 +370,17 @@ class SimplifiedRAG:
                 }
             }
             
-            print(f"✅ SUCCESS! Document processed completely in {processing_time:.2f}s")
+            logger.info(f"✅ SUCCESS! Document processed completely in {processing_time:.2f}s") # Changed from print
             return result
             
         except Exception as e:
+            logger.error(f"❌ FAILED to process document {filename}: {e}", exc_info=True)
+            # Return error response
             return {
                 'success': False,
                 'error': str(e),
                 'document_id': None,
-                'processing_time_seconds': time.time() - start_time
+                'processing_time_seconds': round(time.time() - start_time, 2)
             }
 
     def function_2_add_to_existing_collection(self, document_name: str) -> Dict[str, Any]:
@@ -334,27 +396,36 @@ class SimplifiedRAG:
         Returns:
             Dict with processing results
         """
-        print("➕ Adding document to existing collection...")
+        logger.info(f"➕ Adding document '{document_name}' to existing collection...")
         
-        # Get current document count
-        stats = self.index.describe_index_stats()
-        initial_vector_count = stats['total_vector_count']
-        
-        # Process the document (same as function 1)
-        result = self._function_1_process_complete_document(document_name)
-        
-        if result['success']:
-            # Update result with collection info
-            new_stats = self.index.describe_index_stats()
-            result['collection_info'] = {
-                'total_vectors_before': initial_vector_count,
-                'total_vectors_after': new_stats['total_vector_count'],
-                'vectors_added': result['pinecone_vectors_uploaded']
-            }
+        try:
+            # Get current document count
+            stats = self.index.describe_index_stats()
+            initial_vector_count = stats['total_vector_count']
+            logger.info(f"Collection has {initial_vector_count} vectors before adding.")
             
-            print(f"✅ Document added! Collection now has {new_stats['total_vector_count']} total vectors")
+            # Process the document (same as function 1)
+            result = self._function_1_process_complete_document(document_name)
+            
+            # If processing was successful, add collection info to the result
+            if result['success']:
+                # Get new stats after adding
+                new_stats = self.index.describe_index_stats()
+                result['collection_info'] = {
+                    'total_vectors_before': initial_vector_count,
+                    'total_vectors_after': new_stats['total_vector_count'],
+                    'vectors_added': result.get('pinecone_vectors_uploaded', 0)
+                }
+                
+                logger.info(f"✅ Document added! Collection now has {new_stats['total_vector_count']} total vectors")
+            else:
+                logger.error(f"Failed to add document '{document_name}': {result.get('error')}")
+
+            return result
         
-        return result
+        except Exception as e:
+            logger.error(f"❌ FAILED to add document {document_name} to collection: {e}", exc_info=True)
+            return {'success': False, 'error': str(e)}
 
     def function_3_replace_entire_database(self, document_name: str) -> Dict[str, Any]:
         """
@@ -369,40 +440,44 @@ class SimplifiedRAG:
         Returns:
             Dict with processing results
         """
-        print("🔄 Replacing entire database...")
+        logger.info(f"🔄 Replacing entire database with document: {document_name}...")
         
         try:
-            # Get current stats
+            # Get current stats before deleting
             initial_stats = self.index.describe_index_stats()
             initial_count = initial_stats['total_vector_count']
             
-            print(f"⚠️ Deleting {initial_count} existing vectors...")
+            logger.warning(f"⚠️ Deleting {initial_count} existing vectors...")
             
             # Delete all existing vectors
             self.index.delete(delete_all=True)
             
-            print("🗑️ Database cleared!")
+            logger.info("🗑️ Database cleared!")
             
             # Process new document
             result = self._function_1_process_complete_document(document_name)
             
+            # If processing was successful, add replacement info
             if result['success']:
                 result['database_replacement_info'] = {
                     'vectors_deleted': initial_count,
-                    'new_vectors_uploaded': result['pinecone_vectors_uploaded'],
+                    'new_vectors_uploaded': result.get('pinecone_vectors_uploaded', 0),
                     'replacement_completed': True
                 }
                 
-                print(f"✅ Database replaced! Old: {initial_count} vectors → New: {result['pinecone_vectors_uploaded']} vectors")
+                logger.info(f"✅ Database replaced! Old: {initial_count} vectors → New: {result.get('pinecone_vectors_uploaded', 0)} vectors")
+            else:
+                logger.error(f"Database was cleared, but failed to add new document '{document_name}': {result.get('error')}")
             
             return result
             
         except Exception as e:
+            logger.error(f"❌ FAILED to replace database with {document_name}: {e}", exc_info=True)
             return {
                 'success': False,
                 'error': str(e),
                 'database_replacement_info': {
-                    'vectors_deleted': 0,
+                    'vectors_deleted': initial_count, # Report how many were deleted before fail
                     'new_vectors_uploaded': 0,
                     'replacement_completed': False
                 }
@@ -425,34 +500,41 @@ class SimplifiedRAG:
         start_time = time.time()
         
         try:
-            print(f"🤔 Processing question: {question}")
+            logger.info(f"🤔 Processing question: {question[:100]}...") # Log truncated question
             
             # Step 1: Generate question embedding
             question_embedding = self._generate_embeddings([question])[0]
             
             # Step 2: Search Pinecone for relevant chunks
+            logger.info(f"Querying Pinecone with top_k={top_k}...")
             search_results = self.index.query(
                 vector=question_embedding,
                 top_k=top_k,
-                include_metadata=True
+                include_metadata=True  # Get metadata for sources
             )
             
+            # Handle no results found
             if not search_results['matches']:
+                logger.warning(f"No relevant documents found for question: {question[:50]}...")
                 return {
                     'success': False,
                     'error': 'No relevant documents found in the knowledge base',
-                    'answer': None,
+                    'answer': "I'm sorry, I couldn't find any relevant information in the knowledge base to answer that question.",
                     'sources': [],
-                    'query_time_seconds': time.time() - start_time
+                    'query_time_seconds': round(time.time() - start_time, 2)
                 }
             
-            # Step 3: Prepare context for Claude
+            # Step 3: Prepare context and sources for Claude
             context_chunks = []
             sources = []
             
+            logger.info(f"Retrieved {len(search_results['matches'])} context chunks.")
+            
             for match in search_results['matches']:
                 metadata = match['metadata']
+                # Add the actual text to the context
                 context_chunks.append(metadata['text'])
+                # Add source info for citation
                 sources.append({
                     'document_id': metadata['document_id'],
                     'filename': metadata['filename'],
@@ -464,6 +546,7 @@ class SimplifiedRAG:
             # Step 4: Generate answer with Claude
             context_text = "\n\n".join(context_chunks)
             
+            # Create the prompt with context
             prompt = f"""Based on the following context, please answer the question. If the context doesn't contain enough information to answer the question, say so clearly.
 
 Context:
@@ -473,25 +556,32 @@ Question: {question}
 
 Answer:"""
 
-            import json
+            import json  # Kept local as in original
+            # Format the request for Claude 3.5 Sonnet
             request_body = json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 1000
             })
             
+            logger.info("Generating answer with Claude 3.5 Sonnet...")
+            # Invoke the Bedrock model
             response = self.bedrock.invoke_model(
                 modelId=self.chat_model,
                 body=request_body,
                 contentType='application/json'
             )
             
-            import json
+            import json  # Kept local as in original
+            # Parse the response
             result = json.loads(response['body'].read())
+            # Extract the text answer
             answer = result['content'][0]['text'] if 'content' in result else result.get('completion', 'No answer generated')
             
             query_time = time.time() - start_time
+            logger.info(f"✅ Successfully answered question in {query_time:.2f}s")
             
+            # Return the complete response
             return {
                 'success': True,
                 'answer': answer,
@@ -507,12 +597,13 @@ Answer:"""
             }
             
         except Exception as e:
+            logger.error(f"❌ FAILED to answer question '{question[:50]}...': {e}", exc_info=True)
             return {
                 'success': False,
                 'error': str(e),
                 'answer': None,
                 'sources': [],
-                'query_time_seconds': time.time() - start_time
+                'query_time_seconds': round(time.time() - start_time, 2)
             }
     
     # =================
@@ -522,180 +613,52 @@ Answer:"""
     def get_database_stats(self) -> Dict[str, Any]:
         """Get current database statistics"""
         try:
+            # Get stats directly from Pinecone index
             stats = self.index.describe_index_stats()
+            logger.info(f"Retrieved DB stats: {stats}")
             return {
                 'total_vectors': stats['total_vector_count'],
-                'index_fullness': stats.get('index_fullness', 0),
-                'dimension': 1024,
+                'index_fullness': stats.get('index_fullness', 0), # Serverless may not have this
+                'dimension': stats.get('dimension', 1024), # Get dimension if available
                 'index_name': self.index_name
             }
         except Exception as e:
+            logger.error(f"Failed to get database stats: {e}", exc_info=True)
             return {'error': str(e)}
     
     def list_all_documents(self) -> List[Dict[str, Any]]:
         """List all documents in the database with metadata"""
         try:
-            # Query to get some sample vectors and extract document info
+            logger.info("Listing all documents... (uses dummy query)")
+            # Query with a dummy vector to get a sample of vectors
+            # This is a workaround as Pinecone doesn't have a "list all" metadata API
             sample_results = self.index.query(
                 vector=[0.0] * 1024,  # Dummy vector
                 top_k=1000,  # Get many results to find all documents
                 include_metadata=True
             )
             
-            # Group by document_id
+            # Group by document_id to aggregate document info
             documents = {}
             for match in sample_results['matches']:
                 metadata = match['metadata']
-                doc_id = metadata['document_id']
+                doc_id = metadata.get('document_id', 'unknown')
                 
+                # If this is the first time seeing this doc_id, initialize it
                 if doc_id not in documents:
                     documents[doc_id] = {
                         'document_id': doc_id,
-                        'filename': metadata['filename'],
-                        'created_at': metadata['created_at'],
+                        'filename': metadata.get('filename', 'unknown'),
+                        'created_at': metadata.get('created_at', 'unknown'),
                         'chunk_count': 0
                     }
+                # Increment the chunk count for this document
                 documents[doc_id]['chunk_count'] += 1
             
+            logger.info(f"Found {len(documents)} unique documents.")
+            # Return the aggregated list of documents
             return list(documents.values())
             
         except Exception as e:
-            return []
-
-
-# =================
-# INTERACTIVE DEMO
-# =================
-
-# def run_interactive_demo():
-#     """Interactive demo for testing the 4 core functions"""
-#     print("🚀 Simplified RAG System - Interactive Demo")
-#     print("=" * 50)
-    
-#     try:
-#         rag = SimplifiedRAG()
-        
-#         while True:
-#             print(f"\n📊 Database Stats: {rag.get_database_stats()['total_vectors']} vectors")
-            
-#             print("\n🔧 SELECT FUNCTION:")
-#             print("1. 🚀 Process Complete Document (PDF → Pinecone)")
-#             print("2. ➕ Add Document to Existing Collection")
-#             print("3. 🔄 Replace Entire Database")
-#             print("4. ❓ Ask Questions")
-#             print("5. 📋 List All Documents")
-#             print("6. 🚪 Exit")
-#             print("=" * 50)
-            
-#             choice = input("👉 Select function (1-6): ").strip()
-            
-#             if choice == "1":
-#                 print("\n🚀 FUNCTION 1: Process Complete Document")
-#                 pdf_path = input("📄 Enter PDF file path: ").strip()
-#                 doc_name = input("📝 Document name (optional): ").strip() or None
-                
-#                 result = rag.function_1_process_complete_document(pdf_path, doc_name)
-                
-#                 if result['success']:
-#                     print(f"\n✅ SUCCESS!")
-#                     print(f"📄 Document ID: {result['document_id']}")
-#                     print(f"⏱️ Processing Time: {result['processing_time_seconds']}s")
-#                     print(f"📊 Total Chunks: {result['total_chunks']}")
-#                     print(f"📤 Vectors Uploaded: {result['pinecone_vectors_uploaded']}")
-#                 else:
-#                     print(f"\n❌ ERROR: {result['error']}")
-            
-#             elif choice == "2":
-#                 print("\n➕ FUNCTION 2: Add to Existing Collection")
-#                 pdf_path = input("📄 Enter PDF file path: ").strip()
-#                 doc_name = input("📝 Document name (optional): ").strip() or None
-                
-#                 result = rag.function_2_add_to_existing_collection(pdf_path, doc_name)
-                
-#                 if result['success']:
-#                     print(f"\n✅ Document Added!")
-#                     print(f"📄 Document ID: {result['document_id']}")
-#                     print(f"📊 Vectors Added: {result['pinecone_vectors_uploaded']}")
-#                     if 'collection_info' in result:
-#                         info = result['collection_info']
-#                         print(f"📈 Total Vectors: {info['total_vectors_before']} → {info['total_vectors_after']}")
-#                 else:
-#                     print(f"\n❌ ERROR: {result['error']}")
-            
-#             elif choice == "3":
-#                 print("\n🔄 FUNCTION 3: Replace Entire Database")
-#                 print("⚠️ WARNING: This will DELETE ALL existing documents!")
-#                 confirm = input("Type 'YES' to confirm: ").strip()
-                
-#                 if confirm == "YES":
-#                     pdf_path = input("📄 Enter PDF file path: ").strip()
-#                     doc_name = input("📝 Document name (optional): ").strip() or None
-                    
-#                     result = rag.function_3_replace_entire_database(pdf_path, doc_name)
-                    
-#                     if result['success']:
-#                         print(f"\n✅ Database Replaced!")
-#                         print(f"📄 New Document ID: {result['document_id']}")
-#                         info = result['database_replacement_info']
-#                         print(f"🗑️ Deleted: {info['vectors_deleted']} vectors")
-#                         print(f"📤 Uploaded: {info['new_vectors_uploaded']} vectors")
-#                     else:
-#                         print(f"\n❌ ERROR: {result['error']}")
-#                 else:
-#                     print("❌ Operation cancelled")
-            
-#             elif choice == "4":
-#                 print("\n❓ FUNCTION 4: Ask Questions")
-                
-#                 while True:
-#                     question = input("\n🤔 Your question (or 'back' to return): ").strip()
-#                     if question.lower() == 'back':
-#                         break
-#                     if not question:
-#                         continue
-                    
-#                     result = rag.function_4_ask_questions(question)
-                    
-#                     if result['success']:
-#                         print(f"\n💡 Answer:")
-#                         print(result['answer'])
-                        
-#                         if result['sources']:
-#                             print(f"\n📚 Sources ({len(result['sources'])}):")
-#                             for i, source in enumerate(result['sources'][:3], 1):
-#                                 print(f"   {i}. {source['filename']} (Page {source['page_number']}) - Score: {source['relevance_score']}")
-                        
-#                         print(f"\n⏱️ Query Time: {result['query_time_seconds']}s")
-#                     else:
-#                         print(f"\n❌ ERROR: {result['error']}")
-            
-#             elif choice == "5":
-#                 print("\n📋 ALL DOCUMENTS")
-#                 docs = rag.list_all_documents()
-                
-#                 if docs:
-#                     for doc in docs:
-#                         print(f"\n📄 {doc['filename']}")
-#                         print(f"   ID: {doc['document_id']}")
-#                         print(f"   Chunks: {doc['chunk_count']}")
-#                         print(f"   Created: {doc['created_at']}")
-#                 else:
-#                     print("📭 No documents found")
-            
-#             elif choice == "6":
-#                 print("\n👋 Goodbye! Your documents are safely stored in Pinecone.")
-#                 break
-            
-#             else:
-#                 print("❌ Invalid choice! Please select 1-6.")
-    
-#     except Exception as e:
-#         print(f"❌ System Error: {e}")
-#         print("\n💡 Make sure:")
-#         print("1. Your .env file has all required API keys")
-#         print("2. AWS credentials are configured")
-#         print("3. Pinecone API key is valid")
-
-
-# if __name__ == "__main__":
-#     run_interactive_demo()
+            logger.error(f"Failed to list all documents: {e}", exc_info=True)
+            return [] # Return empty list on failure
