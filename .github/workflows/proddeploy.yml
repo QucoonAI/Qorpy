@@ -1,0 +1,47 @@
+name: CI/CD for Lambda Deployment
+
+on:
+  push:
+    branches:
+      - prod
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v2
+
+      - name: Set up AWS CLI with credentials
+        run: |
+          # Configure AWS CLI with the AWS credentials from secrets
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ secrets.AWS_REGION }}
+
+      - name: Log in to Amazon ECR using AWS CLI
+        run: |
+          # Log in to ECR using the AWS CLI with region from secrets
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.ECR_URL }}
+
+      - name: Build Docker image
+        run: |
+          # Build the Docker image without pushing it
+          docker build -t ${{ secrets.ECR_URL }}/${{ secrets.ECR_REPOSITORY }}:latest .
+
+      - name: Push Docker image to ECR
+        run: |
+          # Push the Docker image to ECR
+          docker push ${{ secrets.ECR_URL }}/${{ secrets.ECR_REPOSITORY }}:latest
+
+      - name: Deploy Docker image to AWS Lambda using AWS CLI
+        run: |
+          # Deploy the Docker image to Lambda
+          aws lambda update-function-code \
+            --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+            --image-uri ${{ secrets.ECR_URL }}/${{ secrets.ECR_REPOSITORY }}:latest \
+            --region ${{ secrets.AWS_REGION }}

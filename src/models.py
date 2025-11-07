@@ -5,10 +5,8 @@ This module defines the data structures used for validating
 request and response bodies in the FastAPI application.
 """
 
-import logging
-from pydantic import BaseModel
-
-logger = logging.getLogger(__name__)
+from typing import Any, Optional, Union
+from pydantic import BaseModel, Field
 
 # Request/Response models
 class QuestionRequest(BaseModel):
@@ -21,7 +19,15 @@ class QuestionRequest(BaseModel):
     """
     question: str  # The user's question to be sent to the RAG system.
     
-    # Note: Pydantic models automatically handle the data validation.
-    # If a request is received without a 'question' field or if it's not
-    # a string, FastAPI will automatically return a 422 Unprocessable Entity
-    # error. No explicit 'try...except' error handling is needed here.
+
+class BaseResponse(BaseModel):
+    """
+    Standard response schema for all API endpoints.
+    """
+    responseCode: str = Field(..., description="Response code: '00' for success, '01' for failure")
+    responseMessage: str = Field(..., description="Detailed message about the operation result")
+    
+class SuccessResponse(BaseResponse):
+    data: Optional[Any] = Field(None, description="Optional data payload (depends on endpoint)")
+
+response = Union[BaseResponse, SuccessResponse]

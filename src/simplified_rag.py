@@ -43,8 +43,8 @@ class SimplifiedRAG:
             self.bedrock = boto3.client(
                 'bedrock-runtime',
                 region_name='us-east-1',
-                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+                # aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                # aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
             )
             # Configuration for chunking
             self.CHUNK_SIZE = 2000  # Target size in tokens
