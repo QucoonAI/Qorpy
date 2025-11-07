@@ -3,7 +3,7 @@ name: CI/CD for Lambda Deployment
 on:
   push:
     branches:
-      - prod
+      - main
 
 jobs:
   build_and_deploy:
