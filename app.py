@@ -14,6 +14,7 @@ S3 upload logic, and background task management for the RAG system.
 
 # --- Standard Library Imports ---
 import os
+import uuid
 import logging  # Added for logging
 from typing import Optional
 
@@ -49,9 +50,15 @@ handler = Mangum(app)
 # --- Global Initializations ---
 rag_system: Optional[SimplifiedRAG] = None  # Type hint for the RAG system instance
 MAX_FILE_SIZE_MB = 2  # 2 MB limit
-S3_BUCKET = os.getenv("S3_BUCKET_NAME", "simplified-rag-app")  # S3 bucket from env
+S3_BUCKET = os.getenv("S3_BUCKET_NAME")  # S3 bucket from env
 S3_REGION = os.getenv("AWS_REGION", "us-east-1")  # AWS region from env
 s3_client = boto3.client("s3", region_name=S3_REGION)  # Boto3 S3 client
+
+tasks = {} 
+
+
+def generate_task_id() -> str:
+    return str(uuid.uuid4())
 
 
 @app.on_event("startup")
@@ -63,9 +70,9 @@ async def startup_event():
     global rag_system  # Declare intention to modify the global variable
     try:
         rag_system = SimplifiedRAG()
-        logger.info("✅ RAG system initialized successfully!")  # Changed from print
+        logger.info("RAG system initialized successfully!")  # Changed from print
     except Exception as e:
-        logger.error(f"❌ Failed to initialize RAG system: {e}")  # Changed from print
+        logger.error(f"Failed to initialize RAG system: {e}")  # Changed from print
         rag_system = None  # Ensure it's None if init fails
 
 
@@ -80,7 +87,6 @@ async def root():
         "responseCode": "00",
         "responseMessage": "Simplified RAG API is running successfully",
         }
-
 
 
 @app.post("/upload_file", response_model=response)
@@ -206,14 +212,13 @@ async def get_stats():
         }
 
 
-
-@app.post("/update-vector-db", response_model=response)
-async def update_vector_db(
+@app.post("/insert-doc-vector-db", response_model=response)
+async def insert_doc_vector_db(
     background_tasks: BackgroundTasks,
     doc_id: str = Form(...),
 ):
     """
-    FUNCTION 2: Update Vector Database with Document Embeddings
+    Update Vector Database with new Document Embeddings
 
     This endpoint:
     - Adds the vector embeddings of the given document (by doc_id) to the existing vector database.
@@ -229,17 +234,23 @@ async def update_vector_db(
                 "responseMessage": "RAG system not initialized"
             }
 
+        task_id = generate_task_id()
+        tasks[task_id] = {"status": "running", "message": f"Updating vectors for {doc_id}"}
+
         # Define the background task
         def background_update():
             """Safely update or create the VectorDB with vectors from the document."""
             try:
                 logger.info(f"Starting background update for doc_id: {doc_id}")
-                rag_system.function_2_add_to_existing_collection(
-                    document_name=doc_id
-                )
-                logger.info(f"✅ Successfully updated vector database for doc_id: {doc_id}")
+                _ = rag_system.add_to_existing_collection(filename=doc_id)
+                tasks[task_id]["status"] = "done"
+                tasks[task_id]["message"] = f"Successfully updated vectors for {doc_id}"
+                logger.info(f"Successfully updated vector database for doc_id: {doc_id}")
+
             except Exception as e:
-                logger.error(f"❌ Background update failed for doc_id {doc_id}: {e}")
+                logger.error(f"Background update failed for doc_id {doc_id}: {e}")
+                tasks[task_id]["status"] = "failed"
+                tasks[task_id]["message"] = f"Failed: {str(e)}"
 
         # Add background task
         background_tasks.add_task(background_update)
@@ -250,7 +261,7 @@ async def update_vector_db(
             "responseMessage": f"Background task started to update or create VectorDB with document vectors for '{doc_id}'.",
             "data": {
                 "doc_id": doc_id,
-                "status": "in_progress"
+                "task_id": task_id
             }
         }
 
@@ -262,20 +273,84 @@ async def update_vector_db(
         }
 
 
-@app.post("/replace-vector-database-vectors", response_model=response)
-async def replace_vector_db_vectors(
+@app.post("/replace-document-vectors", response_model=response)
+async def replace_document_vectors_endpoint(
     background_tasks: BackgroundTasks,
     doc_id: str = Form(...),
     confirm: str = Form(...)
 ):
     """
-    FUNCTION: Replace Vector Database with Document Content
+    Replace vectors for a specific document in Pinecone.
+
+    Only deletes vectors associated with the given document (metadata field 'filename').
+    Requires confirm="YES" to proceed. Runs in background.
+    """
+    try:
+        # Check if RAG system is initialized
+        if not rag_system:
+            logger.error("POST /replace-document-vectors failed: RAG system not initialized.")
+            return {
+                "responseCode": "01",
+                "responseMessage": "RAG system not initialized"
+            }
+
+        # Confirmation check
+        if confirm.lower() != "yes":
+            logger.warning(f"POST /replace-document-vectors denied for {doc_id}: Confirmation not 'YES'.")
+            return {
+                "responseCode": "01",
+                "responseMessage": "Must confirm with 'YES' to replace document vectors"
+            }
+
+        task_id = generate_task_id()
+        tasks[task_id] = {"status": "running", "message": f"Replacing vectors for {doc_id}"}
+        
+        # Background replacement logic
+        def background_replace():
+            """Wrapper for background task with error handling."""
+            try:
+                logger.info(f"Starting background task 'replace_document_vectors' for {doc_id}")
+                result = rag_system.replace_specific_document_vectors(filename=doc_id)
+                tasks[task_id]["status"] = "done"
+                tasks[task_id]["message"] = f"Successfully replaced vectors for {doc_id}"
+                logger.info(f"Background task completed for {doc_id}: {result}")
+
+            except Exception as e:
+                logger.error(f"Background task failed for {doc_id}: {e}")
+                tasks[task_id]["status"] = "failed"
+                tasks[task_id]["message"] = f"Failed: {str(e)}"
+
+        # Schedule the background task
+        background_tasks.add_task(background_replace)
+
+        # Return structured success response
+        return {
+            "responseCode": "00",
+            "responseMessage": "Document vector replacement started successfully",
+            "data": {
+                "doc_id": doc_id,
+                "task_id": task_id
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Replace document vectors endpoint error: {str(e)}")
+        return {
+            "responseCode": "01",
+            "responseMessage": f"Document vector replacement failed: {str(e)}"
+        }
+    
+
+@app.post("/reset-vector-db", response_model=response)
+async def reset_vector_db(
+    confirm: str = Form(...)
+):
+    """
+    Reset Vector Database
 
     WARNING: This operation deletes all existing vectors from the database 
-    and rebuilds it using the content from the document specified by `doc_id`.
 
     Requires confirm="YES" to proceed.
-    The replacement runs as a background task.
     """
     try:
         # Check if RAG system is initialized
@@ -293,28 +368,13 @@ async def replace_vector_db_vectors(
                 "responseCode": "01",
                 "responseMessage": "Must confirm with 'YES' to replace entire vector database"
             }
-
-        # Background replacement logic
-        def background_replace():
-            """Wrapper function for the background task to include error handling."""
-            try:
-                logger.info(f"Starting background task 'replace_vector_database' for doc_id={doc_id}")
-                rag_system.function_3_replace_entire_database(document_name=doc_id)
-                logger.info(f"✅ Successfully completed background task 'replace_vector_database' for doc_id={doc_id}")
-            except Exception as e:
-                logger.error(f"❌ Background task 'replace_vector_database' failed for doc_id={doc_id}: {e}")
-
-        # Schedule the background task
-        background_tasks.add_task(background_replace)
+        result = rag_system.reset_vector_database()
 
         # Return structured success response
         return {
             "responseCode": "00",
-            "responseMessage": "Vector database replacement started successfully",
-            "data": {
-                "doc_id": doc_id,
-                "status": "running in background"
-            }
+            "responseMessage": "Resetting Vector database successfully",
+            "data": result
         }
 
     except Exception as e:
@@ -325,10 +385,26 @@ async def replace_vector_db_vectors(
         }
 
 
+@app.get("/task-status/{task_id}", response_model=response)
+async def task_status(task_id: str):
+    """Endpoint to return status of background task"""
+    task = tasks.get(task_id)
+    if not task:
+        return {
+            "responseCode": "01",
+            "responseMessage": "Task ID not found"
+        }
+    return {
+        "responseCode": "00",
+        "responseMessage": "Task status retrieved",
+        "data": {"task_id": task_id, "status": task["status"], "message": task["message"]}
+    }
+
+
 @app.post("/ask-question", response_model=response)
 async def ask_question(request: QuestionRequest):
     """
-    FUNCTION 4: Ask Questions with RAG Retrieval
+    Ask Questions with RAG Retrieval
     Query the knowledge base and get AI-generated answers with sources.
     Returns structured responses similar to admin endpoints.
     """
@@ -345,7 +421,7 @@ async def ask_question(request: QuestionRequest):
         logger.info(f"Processing question: '{request.question[:50]}...'")
 
         # Call the main RAG function
-        result = rag_system.function_4_ask_questions(question=request.question)
+        result = rag_system.ask_questions(question=request.question)
 
         # Handle successful response
         if result.get("success"):

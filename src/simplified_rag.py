@@ -12,7 +12,8 @@ Perfect for backend developers - clean, simple API
 import os
 import uuid
 import time
-import logging  # Import logging
+import json 
+import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 import boto3
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Load environment variables from .env file
 load_dotenv()
 aws_region = "us-east-1"  # Define AWS region
-S3_BUCKET = os.getenv("S3_BUCKET_NAME", "simplified-rag-app")  # Get S3 bucket from env
+S3_BUCKET = os.getenv("S3_BUCKET_NAME")  # Get S3 bucket from env
 s3_client = boto3.client('s3', region_name=aws_region)  # Initialize Boto3 S3 client
 
 class SimplifiedRAG:
@@ -52,7 +53,7 @@ class SimplifiedRAG:
 
             # Pinecone setup
             pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
-            self.index_name = "rag-documents"
+            self.index_name = os.getenv('PINECONE_INDEX_NAME')
             
             # Create index if it doesn't exist
             if self.index_name not in [index.name for index in pc.list_indexes()]:
@@ -74,9 +75,9 @@ class SimplifiedRAG:
             # Tokenizer for chunking (matches Claude models)
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
             
-            logger.info("✅ Simplified RAG system initialized successfully!") # Changed from print
+            logger.info("Simplified RAG system initialized successfully!") # Changed from print
         except Exception as e:
-            logger.error(f"❌ Failed to initialize SimplifiedRAG: {e}", exc_info=True)
+            logger.error(f"Failed to initialize SimplifiedRAG: {e}", exc_info=True)
             raise  # Re-raise exception to stop application startup if init fails
     
     def _extract_pdf_text(self, file_bytes: bytes) -> List[Dict[str, Any]]:
@@ -129,10 +130,8 @@ class SimplifiedRAG:
             # Log any error during S3 retrieval
             logger.error(f"Error retrieving PDF from S3: {e}", exc_info=True)
             return None
-    
-    
+       
 
-    
     def _generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings using AWS Bedrock Titan"""
         embeddings = []
@@ -140,7 +139,6 @@ class SimplifiedRAG:
         # Iterate over each text chunk
         for text in texts:
             try:
-                import json  # Kept local as in original
                 # Format the request body for Bedrock Titan
                 request_body = json.dumps({"inputText": text})
                 
@@ -151,7 +149,6 @@ class SimplifiedRAG:
                     contentType='application/json'
                 )
                 
-                import json  # Kept local as in original
                 # Parse the response
                 result = json.loads(response['body'].read())
                 # Append the resulting embedding vector
@@ -183,7 +180,7 @@ class SimplifiedRAG:
                     'filename': filename,
                     'page_number': chunk['page_number'],
                     'chunk_index': chunk['chunk_index'],
-                    'text': chunk['text'][:1000],  # Truncate text for metadata
+                    'text': chunk['text'],  # Truncate text for metadata
                     'token_count': chunk['token_count'],
                     'char_count': chunk['char_count'],
                     'created_at': timestamp,
@@ -223,7 +220,6 @@ class SimplifiedRAG:
     # =================
     # CORE FUNCTIONS
     # =================
-    
     def _create_chunks(self, pages: List[Dict]) -> List[Dict[str, Any]]:
         """Recursively chunk text into overlapping, semantically-coherent chunks."""
         try:
@@ -291,9 +287,9 @@ class SimplifiedRAG:
             raise Exception(f"Chunking failed: {str(e)}") # Propagate error
 
 
-    def _function_1_process_complete_document(self, filename: str) -> Dict[str, Any]:
+    def _process_complete_document(self, filename: str) -> Dict[str, Any]:
         """
-        FUNCTION 1: Complete PDF Processing Pipeline
+        Complete PDF Processing Pipeline
         
         Takes a PDF, processes it completely: PDF → Chunks → Embeddings → Pinecone
         Perfect for backend developers - one call does everything.
@@ -310,10 +306,10 @@ class SimplifiedRAG:
             # Generate document ID and name
             document_id = str(uuid.uuid4())  # Unique ID for this document
             
-            logger.info(f"🚀 Processing document: {filename} (ID: {document_id})")
+            logger.info(f"Processing document: {filename} (ID: {document_id})")
             
             # Step 1: Extract PDF text
-            logger.info("📄 Extracting file bytes from S3...")
+            logger.info("Extracting file bytes from S3...")
             # Find the file in S3
             response = s3_client.list_objects_v2(
                 Bucket=S3_BUCKET,
@@ -331,19 +327,19 @@ class SimplifiedRAG:
             total_pages = len(pages)
             
             # Step 2: Create chunks
-            logger.info("✂️ Creating chunks...")
+            logger.info("Creating chunks...")
             chunks = self._create_chunks(pages)
             total_chunks = len(chunks)
             if total_chunks == 0:
                 raise Exception("No text chunks were created from the PDF.")
             
             # Step 3: Generate embeddings
-            logger.info("🧠 Generating embeddings...")
+            logger.info("Generating embeddings...")
             chunk_texts = [chunk['text'] for chunk in chunks]
             embeddings = self._generate_embeddings(chunk_texts)
             
             # Step 4: Upload to Pinecone
-            logger.info("📤 Uploading to Pinecone...")
+            logger.info("Uploading to Pinecone...")
             upload_result = self._upload_to_pinecone(chunks, embeddings, document_id, filename)
             
             # Calculate processing time and statistics
@@ -383,20 +379,21 @@ class SimplifiedRAG:
                 'processing_time_seconds': round(time.time() - start_time, 2)
             }
 
-    def function_2_add_to_existing_collection(self, document_name: str) -> Dict[str, Any]:
+
+    def add_to_existing_collection(self, filename: str) -> Dict[str, Any]:
         """
-        FUNCTION 2: Add Document to Existing Collection
+        Add Document to Existing Collection
         
         Adds a new document to the existing Pinecone database without removing anything.
         Perfect for expanding your knowledge base.
         
         Args:
-            document_name: Name of the document
+            filename: Name of the document
             
         Returns:
             Dict with processing results
         """
-        logger.info(f"➕ Adding document '{document_name}' to existing collection...")
+        logger.info(f"Adding document '{filename}' to existing collection...")
         
         try:
             # Get current document count
@@ -405,7 +402,7 @@ class SimplifiedRAG:
             logger.info(f"Collection has {initial_vector_count} vectors before adding.")
             
             # Process the document (same as function 1)
-            result = self._function_1_process_complete_document(document_name)
+            result = self._process_complete_document(filename)
             
             # If processing was successful, add collection info to the result
             if result['success']:
@@ -419,60 +416,100 @@ class SimplifiedRAG:
                 
                 logger.info(f"✅ Document added! Collection now has {new_stats['total_vector_count']} total vectors")
             else:
-                logger.error(f"Failed to add document '{document_name}': {result.get('error')}")
+                logger.error(f"Failed to add document '{filename}': {result.get('error')}")
 
             return result
         
         except Exception as e:
-            logger.error(f"❌ FAILED to add document {document_name} to collection: {e}", exc_info=True)
+            logger.error(f"❌ FAILED to add document {filename} to collection: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
-    def function_3_replace_entire_database(self, document_name: str) -> Dict[str, Any]:
+
+    def replace_specific_document_vectors(self, filename: str) -> Dict[str, Any]:
         """
-        FUNCTION 3: Replace Entire Database
+        Replace all vectors in Pinecone associated with a specific document.
         
-        Deletes ALL existing documents and uploads this new one.
-        Use with caution - this wipes everything!
+        Only deletes vectors with matching 'filename' metadata, then uploads new vectors.
         
         Args:
-            document_name: Name of the document
+            filename: Name of the document
+            document_id: Unique ID of the document (used in vector IDs)
+        
+        Returns:
+            Dict with processing results
+        """
+        logger.info(f"Replacing vectors for document: {filename}")
+        
+        try:
+            # Get count of vectors with this filename
+            self.index.delete(filter={"filename": {"$eq": filename}})
+
+            logger.warning(f"Deleting vectors associated with {filename}...")
+            
+            # Delete all vectors with metadata filter
+            self.index.delete(filter={"filename": {"$eq": filename}})
+            logger.info(f"Deleted  vectors for {filename}.")
+            
+            # Process new document and get chunks + embeddings
+            result = self._process_complete_document(filename)
+            
+            # Add replacement info
+            if result.get('success'):
+                result['document_replacement_info'] = {
+                    'new_vectors_uploaded': result.get('pinecone_vectors_uploaded', 0),
+                    'replacement_completed': True
+                }
+                
+                logger.info(f"Replacement complete")
+            else:
+                logger.error(f"Replacement failed for {filename}: {result.get('error')}")
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"Failed to replace vectors for {filename}: {e}", exc_info=True)
+            return {
+                'success': False,
+                'error': str(e),
+                'document_replacement_info': {
+                    'new_vectors_uploaded': 0,
+                    'replacement_completed': False
+                }
+            }
+
+
+    def reset_vector_database(self) -> Dict[str, Any]:
+        """
+        Empty Entire Database
+        
+        Deletes ALL existing documents.
+        Use with caution - this wipes everything!
             
         Returns:
             Dict with processing results
         """
-        logger.info(f"🔄 Replacing entire database with document: {document_name}...")
+        logger.info(f"Deleting entire database")
         
         try:
             # Get current stats before deleting
             initial_stats = self.index.describe_index_stats()
             initial_count = initial_stats['total_vector_count']
             
-            logger.warning(f"⚠️ Deleting {initial_count} existing vectors...")
+            logger.warning(f"Deleting {initial_count} existing vectors...")
             
             # Delete all existing vectors
             self.index.delete(delete_all=True)
             
-            logger.info("🗑️ Database cleared!")
-            
-            # Process new document
-            result = self._function_1_process_complete_document(document_name)
-            
-            # If processing was successful, add replacement info
-            if result['success']:
-                result['database_replacement_info'] = {
-                    'vectors_deleted': initial_count,
-                    'new_vectors_uploaded': result.get('pinecone_vectors_uploaded', 0),
-                    'replacement_completed': True
-                }
-                
-                logger.info(f"✅ Database replaced! Old: {initial_count} vectors → New: {result.get('pinecone_vectors_uploaded', 0)} vectors")
-            else:
-                logger.error(f"Database was cleared, but failed to add new document '{document_name}': {result.get('error')}")
-            
-            return result
+            logger.info("Database cleared!")
+                       
+            return {
+                'success':True,
+                'vectors_deleted': initial_count,
+                'reset_completed': True
+            }
             
         except Exception as e:
-            logger.error(f"❌ FAILED to replace database with {document_name}: {e}", exc_info=True)
+            logger.error(f"FAILED to rest database: {e}", exc_info=True)
             return {
                 'success': False,
                 'error': str(e),
@@ -483,9 +520,10 @@ class SimplifiedRAG:
                 }
             }
     
-    def function_4_ask_questions(self, question: str) -> Dict[str, Any]:
+
+    def ask_questions(self, question: str) -> Dict[str, Any]:
         """
-        FUNCTION 4: Ask Questions with RAG Retrieval
+        Ask Questions with RAG Retrieval
         
         Query the knowledge base and get AI-generated answers with sources.
         Uses static top_k=5 for consistent retrieval.
@@ -500,7 +538,7 @@ class SimplifiedRAG:
         start_time = time.time()
         
         try:
-            logger.info(f"🤔 Processing question: {question[:100]}...") # Log truncated question
+            logger.info(f"Processing question: {question[:100]}...") # Log truncated question
             
             # Step 1: Generate question embedding
             question_embedding = self._generate_embeddings([question])[0]
@@ -514,15 +552,15 @@ class SimplifiedRAG:
             )
             
             # Handle no results found
-            if not search_results['matches']:
-                logger.warning(f"No relevant documents found for question: {question[:50]}...")
-                return {
-                    'success': False,
-                    'error': 'No relevant documents found in the knowledge base',
-                    'answer': "I'm sorry, I couldn't find any relevant information in the knowledge base to answer that question.",
-                    'sources': [],
-                    'query_time_seconds': round(time.time() - start_time, 2)
-                }
+            # if not search_results['matches']:
+            #     logger.warning(f"No relevant documents found for question: {question[:50]}...")
+            #     return {
+            #         'success': False,
+            #         'error': 'No relevant documents found in the knowledge base',
+            #         'answer': "I'm sorry, I couldn't find any relevant information in the knowledge base to answer that question.",
+            #         'sources': [],
+            #         'query_time_seconds': round(time.time() - start_time, 2)
+            #     }
             
             # Step 3: Prepare context and sources for Claude
             context_chunks = []
@@ -547,16 +585,28 @@ class SimplifiedRAG:
             context_text = "\n\n".join(context_chunks)
             
             # Create the prompt with context
-            prompt = f"""Based on the following context, please answer the question. If the context doesn't contain enough information to answer the question, say so clearly.
+            prompt = f"""You are a helpful and friendly assistant having a natural conversation with a user. Your job is to answer their question using the information provided below.
 
-Context:
-{context_text}
+                        Context Information:
+                        {context_text}
 
-Question: {question}
+                        User's Question: {question}
 
-Answer:"""
+                        Instructions:
+                        - Answer in a warm, conversational tone as if you're chatting with a friend
+                        - Use the context information above to provide accurate answers
+                        - If the context has everything needed, give a clear and helpful response
+                        - If the context is missing some details, be honest about it in a friendly way. You can say things like:
+                        * "I don't have enough information about that right now, but here's what I do know..."
+                        * "Hmm, I'm not seeing details on that specific part in my current information."
+                        * "I wish I had more info on that for you! Based on what I have here..."
+                        - Keep your response concise but personable
+                        - Avoid robotic phrases like "based on the provided context" or "according to the information given"
+                        - Feel free to use natural conversational elements like "Great question!", "Let me help you with that", etc.
 
-            import json  # Kept local as in original
+                        Your Response:
+                        """
+
             # Format the request for Claude 3.5 Sonnet
             request_body = json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
@@ -572,14 +622,13 @@ Answer:"""
                 contentType='application/json'
             )
             
-            import json  # Kept local as in original
             # Parse the response
             result = json.loads(response['body'].read())
             # Extract the text answer
             answer = result['content'][0]['text'] if 'content' in result else result.get('completion', 'No answer generated')
             
             query_time = time.time() - start_time
-            logger.info(f"✅ Successfully answered question in {query_time:.2f}s")
+            logger.info(f"Successfully answered question in {query_time:.2f}s")
             
             # Return the complete response
             return {
@@ -597,7 +646,7 @@ Answer:"""
             }
             
         except Exception as e:
-            logger.error(f"❌ FAILED to answer question '{question[:50]}...': {e}", exc_info=True)
+            logger.error(f"FAILED to answer question '{question[:50]}...': {e}", exc_info=True)
             return {
                 'success': False,
                 'error': str(e),
@@ -606,10 +655,10 @@ Answer:"""
                 'query_time_seconds': round(time.time() - start_time, 2)
             }
     
+
     # =================
     # UTILITY FUNCTIONS
     # =================
-    
     def get_database_stats(self) -> Dict[str, Any]:
         """Get current database statistics"""
         try:
