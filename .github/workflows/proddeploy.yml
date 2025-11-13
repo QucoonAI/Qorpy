@@ -1,47 +1,209 @@
-name: CI/CD for Lambda Deployment
+name: Deploy Lambda from ECR
 
 on:
   push:
     branches:
-      - main
+      # - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  LAMBDA_FUNCTION_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
 
 jobs:
-  build_and_deploy:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Set up Docker
-        uses: docker/setup-buildx-action@v2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set up AWS CLI with credentials
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Configure AWS CLI with the AWS credentials from secrets
-          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws configure set region ${{ secrets.AWS_REGION }}
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Log in to Amazon ECR using AWS CLI
+      - name: Check if Lambda execution role exists
+        id: check-role
         run: |
-          # Log in to ECR using the AWS CLI with region from secrets
-          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.ECR_URL }}
+          if aws iam get-role --role-name ${{ secrets.LAMBDA_ROLE_NAME }} 2>/dev/null; then
+            echo "role_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "role_exists=false" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Build Docker image
+      - name: Create Lambda execution role
+        if: steps.check-role.outputs.role_exists == 'false'
         run: |
-          # Build the Docker image without pushing it
-          docker build -t ${{ secrets.ECR_URL }}/${{ secrets.ECR_REPOSITORY }}:latest .
+          cat > trust-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "lambda.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          }
+          EOF
 
-      - name: Push Docker image to ECR
-        run: |
-          # Push the Docker image to ECR
-          docker push ${{ secrets.ECR_URL }}/${{ secrets.ECR_REPOSITORY }}:latest
+          aws iam create-role \
+            --role-name ${{ secrets.LAMBDA_ROLE_NAME }} \
+            --assume-role-policy-document file://trust-policy.json \
+            --description "Lambda execution role with S3 and Bedrock access"
 
-      - name: Deploy Docker image to AWS Lambda using AWS CLI
+          aws iam attach-role-policy \
+            --role-name ${{ secrets.LAMBDA_ROLE_NAME }} \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+          aws iam attach-role-policy \
+            --role-name ${{ secrets.LAMBDA_ROLE_NAME }} \
+            --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+          aws iam attach-role-policy \
+            --role-name ${{ secrets.LAMBDA_ROLE_NAME }} \
+            --policy-arn arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+
+          echo "Waiting for role to propagate..."
+          sleep 10
+
+      - name: Get Lambda role ARN
+        id: get-role-arn
         run: |
-          # Deploy the Docker image to Lambda
+          ROLE_ARN=$(aws iam get-role --role-name ${{ secrets.LAMBDA_ROLE_NAME }} --query 'Role.Arn' --output text)
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Check if Lambda function exists
+        id: check-lambda
+        run: |
+          if aws lambda get-function --function-name ${{ env.LAMBDA_FUNCTION_NAME }} 2>/dev/null; then
+            echo "lambda_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "lambda_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Lambda function
+        if: steps.check-lambda.outputs.lambda_exists == 'false'
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image }}
+        run: |
+          aws lambda create-function \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --package-type Image \
+            --code ImageUri=$IMAGE_URI \
+            --role ${{ steps.get-role-arn.outputs.role_arn }} \
+            --timeout 900 \
+            --memory-size ${{ secrets.LAMBDA_MEMORY_SIZE || '512' }} \
+            --environment "Variables={
+              \"PINECONE_API_KEY=${{ secrets.API_KEY }},
+              OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }},
+              DATABASE_URL=${{ secrets.DATABASE_URL }},
+              ENVIRONMENT=${{ secrets.ENVIRONMENT || 'production' }}
+            }"
+
+          echo "Waiting for Lambda function to be active..."
+          aws lambda wait function-active --function-name ${{ env.LAMBDA_FUNCTION_NAME }}
+
+      - name: Update Lambda function code
+        if: steps.check-lambda.outputs.lambda_exists == 'true'
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image }}
+        run: |
           aws lambda update-function-code \
-            --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
-            --image-uri ${{ secrets.ECR_URL }}/${{ secrets.ECR_REPOSITORY }}:latest \
-            --region ${{ secrets.AWS_REGION }}
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --image-uri $IMAGE_URI
+
+          echo "Waiting for Lambda update to complete..."
+          aws lambda wait function-updated --function-name ${{ env.LAMBDA_FUNCTION_NAME }}
+
+      - name: Update Lambda configuration
+        if: steps.check-lambda.outputs.lambda_exists == 'true'
+        run: |
+          echo "Creating environment configuration file..."
+          cat > env.json <<EOF
+          {
+            "Variables": {
+              "PINECONE_API_KEY": "${{ secrets.PINECONE_API_KEY }}",
+              "PINECONE_INDEX_NAME": "${{ secrets.PINECONE_INDEX_NAME }}",
+              "S3_BUCKET_NAME": "${{ secrets.S3_BUCKET_NAME }}",
+              "ENVIRONMENT": "${{ secrets.ENVIRONMENT || 'production' }}"
+            }
+          }
+          EOF
+
+          echo "Updating Lambda configuration..."
+          aws lambda update-function-configuration \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --timeout 900 \
+            --memory-size ${{ secrets.LAMBDA_MEMORY_SIZE || '512' }} \
+            --environment file://env.json
+
+          echo "Waiting for Lambda update to complete..."
+          aws lambda wait function-updated --function-name ${{ env.LAMBDA_FUNCTION_NAME }}
+
+      - name: Check if Function URL exists
+        id: check-function-url
+        run: |
+          if aws lambda get-function-url-config --function-name ${{ env.LAMBDA_FUNCTION_NAME }} 2>/dev/null; then
+            echo "url_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "url_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Function URL
+        if: steps.check-function-url.outputs.url_exists == 'false'
+        run: |
+          aws lambda create-function-url-config \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --auth-type NONE \
+            --cors "AllowOrigins=*,AllowMethods=*,AllowHeaders=*,MaxAge=86400"
+
+          aws lambda add-permission \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --statement-id FunctionURLAllowPublicAccess \
+            --action lambda:InvokeFunctionUrl \
+            --principal "*" \
+            --function-url-auth-type NONE \
+            2>/dev/null || echo "Permission already exists"
+
+      - name: Get Function URL
+        id: get-function-url
+        run: |
+          FUNCTION_URL=$(aws lambda get-function-url-config \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --query 'FunctionUrl' \
+            --output text)
+          echo "function_url=$FUNCTION_URL" >> $GITHUB_OUTPUT
+          echo "### Lambda Function URL" >> $GITHUB_STEP_SUMMARY
+          echo "$FUNCTION_URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deployment Summary
+        run: |
+          echo "### Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Function Name:** ${{ env.LAMBDA_FUNCTION_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${{ steps.build-image.outputs.image }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Function URL:** ${{ steps.get-function-url.outputs.function_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timeout:** 900 seconds (15 minutes)" >> $GITHUB_STEP_SUMMARY
