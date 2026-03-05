@@ -1,18 +1,20 @@
 """
-Simplified RAG System - 4 Core Functions
-========================================
-1. Process complete document (PDF → Chunks → Vectors → Pinecone)
+Simplified RAG System - Core Functions
+=======================================
+1. Process uploaded PDF (PDF bytes -> Q&A Chunks -> Vectors -> Pinecone)
 2. Add document to existing collection
-3. Replace entire database with new document
-4. Ask questions with RAG retrieval
+3. Replace vectors for a specific document
+4. Ask questions with RAG retrieval (sub-query decomposition)
 
-Perfect for backend developers - clean, simple API
+Direct PDF upload via FastAPI - no S3 dependency.
+Chunking strategy: one chunk per Q&A pair.
 """
 
 import os
+import re
 import uuid
 import time
-import json 
+import json
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any
@@ -21,18 +23,14 @@ import tiktoken
 from io import BytesIO
 from pinecone import Pinecone, ServerlessSpec
 from PyPDF2 import PdfReader
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from fastapi import HTTPException
 
 
-# Use the logger initialized in the main app module or configure one here
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
-load_dotenv()
-aws_region = "us-east-1"  # Define AWS region
-S3_BUCKET = os.getenv("S3_BUCKET_NAME")  # Get S3 bucket from env
-s3_client = boto3.client('s3', region_name=aws_region)  # Initialize Boto3 S3 client
+# Load environment variables from .env file (searches current dir and all parents)
+load_dotenv(find_dotenv(usecwd=True) or find_dotenv())
 
 class SimplifiedRAG:
     """Simplified RAG system with 4 core functions for backend integration"""
@@ -44,12 +42,7 @@ class SimplifiedRAG:
             self.bedrock = boto3.client(
                 'bedrock-runtime',
                 region_name='us-east-1',
-                # aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                # aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
             )
-            # Configuration for chunking
-            self.CHUNK_SIZE = 2000  # Target size in tokens
-            self.CHUNK_OVERLAP_PERCENT = 0.2  # 20% overlap
 
             # Pinecone setup
             pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
@@ -75,62 +68,123 @@ class SimplifiedRAG:
             # Tokenizer for chunking (matches Claude models)
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
             
-            logger.info("Simplified RAG system initialized successfully!") # Changed from print
+            logger.info("Simplified RAG system initialized successfully!")
         except Exception as e:
             logger.error(f"Failed to initialize SimplifiedRAG: {e}", exc_info=True)
-            raise  # Re-raise exception to stop application startup if init fails
-    
-    def _extract_pdf_text(self, file_bytes: bytes) -> List[Dict[str, Any]]:
-        """Extract text from PDF with page metadata"""
+            raise
+
+    # =========================
+    # PDF & CHUNKING
+    # =========================
+
+    def _extract_pdf_text(self, file_bytes: bytes) -> str:
+        """Extract all text from a PDF and return as a single string."""
         try:
-            # Create a PdfReader object from the in-memory file bytes
             reader = PdfReader(BytesIO(file_bytes))
-            pages = []
-            
-            # Iterate through each page in the PDF
-            for page_num, page in enumerate(reader.pages, 1):
-                text = page.extract_text().strip()  # Extract and clean text
-                
-                # Only add pages that contain text
+            full_text = ""
+            for page in reader.pages:
+                text = page.extract_text()
                 if text:
-                    pages.append({
-                        'page_number': page_num,
-                        'text': text,
-                        'char_count': len(text)
-                    })
-            
-            logger.info(f"Extracted {len(pages)} pages with text from PDF.")
-            return pages
-            
+                    full_text += text + "\n"
+            logger.info(f"Extracted text from {len(reader.pages)} PDF pages.")
+            return full_text.strip()
         except Exception as e:
             logger.error(f"Failed to extract PDF text: {e}", exc_info=True)
-            # Propagate the error to be caught by the calling function
             raise Exception(f"Failed to extract PDF text: {str(e)}")
 
+    def _create_qa_chunks(self, full_text: str) -> List[Dict[str, Any]]:
+        """
+        Parse PDF text into one chunk per Q&A pair.
 
-    def _get_s3_file_content(self, response, S3_BUCKET: str) -> bytes | None:
-        """Retrieve the first PDF file from S3 and return its bytes."""
-        try:
-            # Loop through the files listed in the S3 response
-            for obj in response.get("Contents", []):
-                key = obj["Key"]
-                # Find the first file that ends with .pdf
-                if key.lower().endswith(".pdf"):
-                    logger.info(f"Fetching PDF from S3: s3://{S3_BUCKET}/{key}")
-                    # Get the file object from S3
-                    file_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-                    # Read the file's content into bytes and return it
-                    return file_obj["Body"].read()  # return bytes immediately
+        Expected format:
+            [CATEGORY: SomeName]
+            Q: <question>
+            A: <answer>
 
-            # If no PDF file is found
-            logger.warning("No PDF files found in S3 response.")
-            return None
+        Normalizes the extracted text first so that Q:, A:, [CATEGORY:,
+        and SECTION markers always appear at the start of a line, regardless
+        of how PyPDF2 joined them during extraction.
+        """
+        chunks: List[Dict[str, Any]] = []
+        section_pattern = re.compile(r'SECTION\s+\d+\s*[\u2014\u2013\-]\s*(.+)')
+        category_pattern = re.compile(r'\[CATEGORY:\s*(.+?)\]')
 
-        except Exception as e:
-            # Log any error during S3 retrieval
-            logger.error(f"Error retrieving PDF from S3: {e}", exc_info=True)
-            return None
-       
+        # --- Normalization: force key markers onto their own lines ---
+        # Handles PDFs where PyPDF2 joins "...text Q: next question" on one line
+        full_text = re.sub(r'(?<!\n)(Q:\s)', r'\n\1', full_text)
+        full_text = re.sub(r'(?<!\n)(A:\s)', r'\n\1', full_text)
+        full_text = re.sub(r'(?<!\n)(\[CATEGORY:)', r'\n\1', full_text)
+        full_text = re.sub(r'(?<!\n)(SECTION\s+\d+)', r'\n\1', full_text)
+
+        current_section = "General"
+        current_category = "General"
+
+        lines = full_text.split('\n')
+        i = 0
+        chunk_index = 0
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            section_match = section_pattern.match(line)
+            if section_match:
+                current_section = section_match.group(1).strip()
+                i += 1
+                continue
+
+            category_match = category_pattern.match(line)
+            if category_match:
+                current_category = category_match.group(1).strip()
+                i += 1
+                continue
+
+            if line.startswith('Q:'):
+                question_text = line[2:].strip()
+                i += 1
+                while i < len(lines):
+                    l = lines[i].strip()
+                    if l.startswith('A:') or l.startswith('Q:') or l.startswith('[CATEGORY') or section_pattern.match(l):
+                        break
+                    question_text += ' ' + l
+                    i += 1
+
+                answer_text = ""
+                if i < len(lines) and lines[i].strip().startswith('A:'):
+                    answer_text = lines[i].strip()[2:].strip()
+                    i += 1
+                    while i < len(lines):
+                        l = lines[i].strip()
+                        if l.startswith('Q:') or l.startswith('[CATEGORY') or section_pattern.match(l):
+                            break
+                        if l == '':
+                            j = i + 1
+                            while j < len(lines) and lines[j].strip() == '':
+                                j += 1
+                            if j >= len(lines) or lines[j].strip().startswith('Q:') or lines[j].strip().startswith('[CATEGORY') or section_pattern.match(lines[j].strip()):
+                                break
+                        answer_text += ' ' + l
+                        i += 1
+
+                chunk_text = f"Q: {question_text.strip()}\nA: {answer_text.strip()}"
+                tokens = self.tokenizer.encode(chunk_text)
+
+                chunks.append({
+                    'text': chunk_text,
+                    'question': question_text.strip(),
+                    'answer': answer_text.strip(),
+                    'section': current_section,
+                    'category': current_category,
+                    'token_count': len(tokens),
+                    'char_count': len(chunk_text),
+                    'chunk_index': chunk_index,
+                })
+                chunk_index += 1
+            else:
+                i += 1
+
+        logger.info(f"Created {len(chunks)} Q&A chunks from PDF text.")
+        return chunks
+
 
     def _generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings using AWS Bedrock Titan"""
@@ -178,13 +232,16 @@ class SimplifiedRAG:
                 metadata = {
                     'document_id': document_id,
                     'filename': filename,
-                    'page_number': chunk['page_number'],
+                    'section': chunk.get('section', ''),
+                    'category': chunk.get('category', ''),
+                    'question': chunk.get('question', ''),
+                    'answer': chunk.get('answer', ''),
                     'chunk_index': chunk['chunk_index'],
-                    'text': chunk['text'],  # Truncate text for metadata
+                    'text': chunk['text'],
                     'token_count': chunk['token_count'],
                     'char_count': chunk['char_count'],
                     'created_at': timestamp,
-                    'chunk_type': 'text'  # For potential future use
+                    'chunk_type': 'qa_pair',
                 }
                 
                 # Append the final vector object
@@ -217,161 +274,66 @@ class SimplifiedRAG:
             logger.error(f"Failed to upload vectors to Pinecone: {e}", exc_info=True)
             raise Exception(f"Pinecone upload failed: {str(e)}") # Propagate error
     
-    # =================
+    # =========================
     # CORE FUNCTIONS
-    # =================
-    def _create_chunks(self, pages: List[Dict]) -> List[Dict[str, Any]]:
-        """Recursively chunk text into overlapping, semantically-coherent chunks."""
-        try:
-            chunks = []
-            overlap_tokens = int(self.CHUNK_SIZE * self.CHUNK_OVERLAP_PERCENT)
+    # =========================
 
-            def recursive_chunk(text: str, page_number: int):
-                """Nested helper function to recursively chunk text."""
-                tokens = self.tokenizer.encode(text)
-                
-                # Base case: text fits within chunk_size
-                if len(tokens) <= self.CHUNK_SIZE:
-                    chunks.append({
-                        'text': text,
-                        'page_number': page_number,
-                        'token_count': len(tokens),
-                        'char_count': len(text),
-                        'chunk_index': len(chunks)  # Index based on total chunks
-                    })
-                    return
-
-                # Recursive case: text is too long and needs splitting
-                # Try to split at a semantic boundary (e.g., sentence or paragraph)
-                midpoint = self.CHUNK_SIZE - overlap_tokens
-                decoded_text = self.tokenizer.decode(tokens[:midpoint])
-                
-                # Find the best split point (sentence end, newline, etc.)
-                split_point = max(
-                    decoded_text.rfind('. '),
-                    decoded_text.rfind('\n'),
-                    decoded_text.rfind('? '),
-                    decoded_text.rfind('! ')
-                )
-                
-                # Fallback to raw token split if no good semantic split is found
-                if split_point == -1 or split_point < self.CHUNK_SIZE * 0.5:
-                    split_point = midpoint  # fallback to raw token split
-
-                # Create the first chunk
-                first_chunk = decoded_text[:split_point].strip()
-                # Create the remaining text with overlap
-                remaining_text = self.tokenizer.decode(tokens[split_point - overlap_tokens:]).strip()
-
-                # Add first chunk to the list
-                chunks.append({
-                    'text': first_chunk,
-                    'page_number': page_number,
-                    'token_count': len(self.tokenizer.encode(first_chunk)),
-                    'char_count': len(first_chunk),
-                    'chunk_index': len(chunks)
-                })
-
-                # Recurse on remaining text
-                if remaining_text:
-                    recursive_chunk(remaining_text, page_number)
-
-            # Iterate over all pages and chunk their text
-            for page in pages:
-                recursive_chunk(page['text'], page['page_number'])
-            
-            logger.info(f"Created {len(chunks)} chunks from {len(pages)} pages.")
-            return chunks
-        except Exception as e:
-            logger.error(f"Failed during text chunking: {e}", exc_info=True)
-            raise Exception(f"Chunking failed: {str(e)}") # Propagate error
-
-
-    def _process_complete_document(self, filename: str) -> Dict[str, Any]:
+    def process_document(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
         """
-        Complete PDF Processing Pipeline
-        
-        Takes a PDF, processes it completely: PDF → Chunks → Embeddings → Pinecone
-        Perfect for backend developers - one call does everything.
-        
-        Args:
-            filename: Name of the PDF file in S3
-            
-        Returns:
-            Dict with processing results and metadata for backend tracking
+        Complete PDF Processing Pipeline (from bytes).
+        PDF bytes -> Q&A Chunks -> Embeddings -> Pinecone
         """
         start_time = time.time()
-        
+
         try:
-            # Generate document ID and name
-            document_id = str(uuid.uuid4())  # Unique ID for this document
-            
+            document_id = str(uuid.uuid4())
             logger.info(f"Processing document: {filename} (ID: {document_id})")
-            
-            # Step 1: Extract PDF text
-            logger.info("Extracting file bytes from S3...")
-            # Find the file in S3
-            response = s3_client.list_objects_v2(
-                Bucket=S3_BUCKET,
-                Prefix=f"{filename.lower().replace(' ', '_')}.pdf"
-            )
-            
-            # Handle file not found
-            if 'Contents' not in response:
-                logger.error(f"File not found in S3 for: {filename}")
-                raise HTTPException(status_code=404, detail="No files found for the specified company")
-            
-            # Get file content and extract text
-            file_bytes = self._get_s3_file_content(response, S3_BUCKET)
-            pages = self._extract_pdf_text(file_bytes) #type: ignore
-            total_pages = len(pages)
-            
-            # Step 2: Create chunks
-            logger.info("Creating chunks...")
-            chunks = self._create_chunks(pages)
+
+            # Step 1: Extract text
+            full_text = self._extract_pdf_text(file_bytes)
+            if not full_text:
+                raise Exception("PDF contained no extractable text.")
+
+            # Step 2: Create Q&A chunks
+            logger.info("Parsing Q&A chunks...")
+            chunks = self._create_qa_chunks(full_text)
             total_chunks = len(chunks)
             if total_chunks == 0:
-                raise Exception("No text chunks were created from the PDF.")
-            
+                raise Exception("No Q&A pairs found in the PDF. Ensure the format uses 'Q:' and 'A:' prefixes.")
+
             # Step 3: Generate embeddings
             logger.info("Generating embeddings...")
             chunk_texts = [chunk['text'] for chunk in chunks]
             embeddings = self._generate_embeddings(chunk_texts)
-            
+
             # Step 4: Upload to Pinecone
             logger.info("Uploading to Pinecone...")
             upload_result = self._upload_to_pinecone(chunks, embeddings, document_id, filename)
-            
-            # Calculate processing time and statistics
+
             processing_time = time.time() - start_time
-            avg_chunk_length = sum(chunk['char_count'] for chunk in chunks) / len(chunks)
             total_tokens = sum(chunk['token_count'] for chunk in chunks)
-            
-            # Prepare success response
+
             result = {
                 'success': True,
                 'document_id': document_id,
                 'filename': filename,
                 'processing_time_seconds': round(processing_time, 2),
-                'total_pages': total_pages,
-                'total_chunks': total_chunks,
+                'total_qa_pairs': total_chunks,
                 'total_tokens': total_tokens,
-                'chunk_size_used': self.CHUNK_SIZE,
-                'avg_chunk_length': round(avg_chunk_length, 1),
                 'pinecone_vectors_uploaded': upload_result['vectors_uploaded'],
                 'created_at': upload_result['timestamp'],
                 'metadata': {
                     'embedding_model': self.embedding_model,
-                    'index_name': self.index_name
+                    'index_name': self.index_name,
+                    'chunking_strategy': 'qa_pair',
                 }
             }
-            
-            logger.info(f"✅ SUCCESS! Document processed completely in {processing_time:.2f}s") # Changed from print
+
+            logger.info(f"Document processed in {processing_time:.2f}s - {total_chunks} Q&A pairs uploaded.")
             return result
-            
+
         except Exception as e:
-            logger.error(f"❌ FAILED to process document {filename}: {e}", exc_info=True)
-            # Return error response
+            logger.error(f"FAILED to process document {filename}: {e}", exc_info=True)
             return {
                 'success': False,
                 'error': str(e),
@@ -380,92 +342,56 @@ class SimplifiedRAG:
             }
 
 
-    def add_to_existing_collection(self, filename: str) -> Dict[str, Any]:
-        """
-        Add Document to Existing Collection
-        
-        Adds a new document to the existing Pinecone database without removing anything.
-        Perfect for expanding your knowledge base.
-        
-        Args:
-            filename: Name of the document
-            
-        Returns:
-            Dict with processing results
-        """
+    def add_to_existing_collection(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+        """Add a document to the existing Pinecone collection without removing anything."""
         logger.info(f"Adding document '{filename}' to existing collection...")
-        
+
         try:
-            # Get current document count
             stats = self.index.describe_index_stats()
             initial_vector_count = stats['total_vector_count']
             logger.info(f"Collection has {initial_vector_count} vectors before adding.")
-            
-            # Process the document (same as function 1)
-            result = self._process_complete_document(filename)
-            
-            # If processing was successful, add collection info to the result
+
+            result = self.process_document(file_bytes, filename)
+
             if result['success']:
-                # Get new stats after adding
                 new_stats = self.index.describe_index_stats()
                 result['collection_info'] = {
                     'total_vectors_before': initial_vector_count,
                     'total_vectors_after': new_stats['total_vector_count'],
                     'vectors_added': result.get('pinecone_vectors_uploaded', 0)
                 }
-                
-                logger.info(f"✅ Document added! Collection now has {new_stats['total_vector_count']} total vectors")
+                logger.info(f"Document added! Collection now has {new_stats['total_vector_count']} total vectors.")
             else:
                 logger.error(f"Failed to add document '{filename}': {result.get('error')}")
 
             return result
-        
+
         except Exception as e:
-            logger.error(f"❌ FAILED to add document {filename} to collection: {e}", exc_info=True)
+            logger.error(f"FAILED to add document {filename} to collection: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
 
-    def replace_specific_document_vectors(self, filename: str) -> Dict[str, Any]:
-        """
-        Replace all vectors in Pinecone associated with a specific document.
-        
-        Only deletes vectors with matching 'filename' metadata, then uploads new vectors.
-        
-        Args:
-            filename: Name of the document
-            document_id: Unique ID of the document (used in vector IDs)
-        
-        Returns:
-            Dict with processing results
-        """
+    def replace_specific_document_vectors(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+        """Replace all vectors for a specific document (delete old, upload new)."""
         logger.info(f"Replacing vectors for document: {filename}")
-        
-        try:
-            # Get count of vectors with this filename
-            self.index.delete(filter={"filename": {"$eq": filename}})
 
-            logger.warning(f"Deleting vectors associated with {filename}...")
-            
-            # Delete all vectors with metadata filter
+        try:
             self.index.delete(filter={"filename": {"$eq": filename}})
-            logger.info(f"Deleted  vectors for {filename}.")
-            
-            # Process new document and get chunks + embeddings
-            result = self._process_complete_document(filename)
-            
-            # Add replacement info
+            logger.info(f"Deleted existing vectors for {filename}.")
+
+            result = self.process_document(file_bytes, filename)
+
             if result.get('success'):
                 result['document_replacement_info'] = {
                     'new_vectors_uploaded': result.get('pinecone_vectors_uploaded', 0),
                     'replacement_completed': True
                 }
-                
-                logger.info(f"Replacement complete")
+                logger.info(f"Replacement complete for {filename}.")
             else:
                 logger.error(f"Replacement failed for {filename}: {result.get('error')}")
-            
+
             return result
-        
+
         except Exception as e:
             logger.error(f"Failed to replace vectors for {filename}: {e}", exc_info=True)
             return {
@@ -521,116 +447,145 @@ class SimplifiedRAG:
             }
     
 
-    def ask_questions(self, question: str) -> Dict[str, Any]:
+    def _generate_sub_queries(self, question: str) -> List[str]:
         """
-        Ask Questions with RAG Retrieval
-        
-        Query the knowledge base and get AI-generated answers with sources.
-        Uses static top_k=5 for consistent retrieval.
-        
-        Args:
-            question: The question to ask
-            
-        Returns:
-            Dict with answer, sources, and metadata
+        Use Claude to silently break a user question into 2 focused sub-queries
+        for better retrieval coverage. Never exposed to the user.
         """
-        top_k = 5  # Static value for consistent retrieval
-        start_time = time.time()
-        
         try:
-            logger.info(f"Processing question: {question[:100]}...") # Log truncated question
-            
-            # Step 1: Generate question embedding
-            question_embedding = self._generate_embeddings([question])[0]
-            
-            # Step 2: Search Pinecone for relevant chunks
-            logger.info(f"Querying Pinecone with top_k={top_k}...")
-            search_results = self.index.query(
-                vector=question_embedding,
-                top_k=top_k,
-                include_metadata=True  # Get metadata for sources
+            prompt = (
+                "Given the following user question, generate exactly 2 focused sub-queries "
+                "that would help retrieve relevant FAQ entries from a knowledge base about "
+                "FIRS e-Invoicing and Qucoon/Qorpy.\n\n"
+                "The sub-queries should:\n"
+                "- Cover different aspects of the question\n"
+                "- Be specific enough to match FAQ entries\n"
+                "- Be phrased as questions or search terms\n\n"
+                f"User question: {question}\n\n"
+                'Return ONLY a JSON array of 2 strings, nothing else. Example:\n'
+                '["sub-query 1 text", "sub-query 2 text"]'
             )
-            
-            # Handle no results found
-            # if not search_results['matches']:
-            #     logger.warning(f"No relevant documents found for question: {question[:50]}...")
-            #     return {
-            #         'success': False,
-            #         'error': 'No relevant documents found in the knowledge base',
-            #         'answer': "I'm sorry, I couldn't find any relevant information in the knowledge base to answer that question.",
-            #         'sources': [],
-            #         'query_time_seconds': round(time.time() - start_time, 2)
-            #     }
-            
-            # Step 3: Prepare context and sources for Claude
-            context_chunks = []
-            sources = []
-            
-            logger.info(f"Retrieved {len(search_results['matches'])} context chunks.")
-            
-            for match in search_results['matches']:
-                metadata = match['metadata']
-                # Add the actual text to the context
-                context_chunks.append(metadata['text'])
-                # Add source info for citation
-                sources.append({
-                    'document_id': metadata['document_id'],
-                    'filename': metadata['filename'],
-                    'page_number': metadata['page_number'],
-                    'relevance_score': round(match['score'], 3),
-                    'chunk_index': metadata['chunk_index']
-                })
-            
-            # Step 4: Generate answer with Claude
-            context_text = "\n\n".join(context_chunks)
-            
-            # Create the prompt with context
-            prompt = f"""You are a helpful and friendly assistant having a natural conversation with a user. Your job is to answer their question using the information provided below.
 
-                        Context Information:
-                        {context_text}
-
-                        User's Question: {question}
-
-                        Instructions:
-                        - Answer in a warm, conversational tone as if you're chatting with a friend
-                        - Use the context information above to provide accurate answers
-                        - If the context has everything needed, give a clear and helpful response
-                        - If the context is missing some details, be honest about it in a friendly way. You can say things like:
-                        * "I don't have enough information about that right now, but here's what I do know..."
-                        * "Hmm, I'm not seeing details on that specific part in my current information."
-                        * "I wish I had more info on that for you! Based on what I have here..."
-                        - Keep your response concise but personable
-                        - Avoid robotic phrases like "based on the provided context" or "according to the information given"
-                        - Feel free to use natural conversational elements like "Great question!", "Let me help you with that", etc.
-
-                        Your Response:
-                        """
-
-            # Format the request for Claude 3.5 Sonnet
             request_body = json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1000
+                "max_tokens": 200
             })
-            
-            logger.info("Generating answer with Claude 3.5 Sonnet...")
-            # Invoke the Bedrock model
+
             response = self.bedrock.invoke_model(
                 modelId=self.chat_model,
                 body=request_body,
                 contentType='application/json'
             )
-            
-            # Parse the response
+
             result = json.loads(response['body'].read())
-            # Extract the text answer
+            text = result['content'][0]['text'].strip()
+            sub_queries = json.loads(text)
+            if isinstance(sub_queries, list) and len(sub_queries) >= 2:
+                logger.info("Generated 2 sub-queries for retrieval.")
+                return sub_queries[:2]
+
+        except Exception as e:
+            logger.warning(f"Sub-query generation failed, using original question: {e}")
+
+        # Fallback: use original question for both slots
+        return [question, question]
+
+    def ask_questions(self, question: str) -> Dict[str, Any]:
+        """
+        Ask a question with RAG retrieval using sub-query decomposition.
+
+        Silently breaks the question into 2 focused sub-queries, retrieves chunks
+        for each independently, deduplicates, then synthesizes one clear answer.
+        Sub-queries are never exposed to the user.
+        """
+        top_k = 5
+        start_time = time.time()
+
+        try:
+            logger.info(f"Processing question: {question[:100]}...")
+
+            # Step 1: Silently generate 2 sub-queries
+            sub_queries = self._generate_sub_queries(question)
+            logger.info("Retrieving chunks for each sub-query independently...")
+
+            # Step 2: Retrieve chunks for each sub-query independently
+            all_matches: Dict[str, Any] = {}
+            for sq in sub_queries:
+                sq_embedding = self._generate_embeddings([sq])[0]
+                search_results = self.index.query(
+                    vector=sq_embedding,
+                    top_k=top_k,
+                    include_metadata=True
+                )
+                for match in search_results['matches']:
+                    # Deduplicate by vector ID, keep highest score
+                    if match['id'] not in all_matches:
+                        all_matches[match['id']] = match
+
+            # Sort by relevance score descending
+            unique_matches = sorted(all_matches.values(), key=lambda m: m['score'], reverse=True)
+            logger.info(f"Retrieved {len(unique_matches)} unique context chunks from both sub-queries.")
+
+            # Step 3: Build context and sources
+            context_chunks = []
+            sources = []
+            for match in unique_matches:
+                metadata = match['metadata']
+                context_chunks.append(metadata['text'])
+                sources.append({
+                    'document_id': metadata.get('document_id', ''),
+                    'filename': metadata.get('filename', ''),
+                    'category': metadata.get('category', ''),
+                    'section': metadata.get('section', ''),
+                    'relevance_score': round(match['score'], 3),
+                    'chunk_index': metadata.get('chunk_index', 0),
+                })
+
+            context_text = "\n\n".join(context_chunks)
+
+            # Step 4: Synthesize one clear answer with Claude
+            prompt = f"""You are a helpful and friendly assistant having a natural conversation with a user. Your job is to answer their question using the information provided below.
+
+Context Information:
+{context_text}
+
+User's Question: {question}
+
+Instructions:
+- Answer in a warm, conversational tone as if you're chatting with a friend
+- Use the context information above to provide accurate answers
+- If the context has everything needed, give a clear and helpful response
+- If the context is missing some details, be honest about it in a friendly way. You can say things like:
+  * "I don't have enough information about that right now, but here's what I do know..."
+  * "Hmm, I'm not seeing details on that specific part in my current information."
+  * "I wish I had more info on that for you! Based on what I have here..."
+- Keep your response concise but personable
+- Avoid robotic phrases like "based on the provided context" or "according to the information given"
+- Feel free to use natural conversational elements like "Great question!", "Let me help you with that", etc.
+
+Your Response:
+"""
+
+            request_body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1000
+            })
+
+            logger.info("Generating answer with Claude 3.5 Sonnet...")
+            response = self.bedrock.invoke_model(
+                modelId=self.chat_model,
+                body=request_body,
+                contentType='application/json'
+            )
+
+            result = json.loads(response['body'].read())
             answer = result['content'][0]['text'] if 'content' in result else result.get('completion', 'No answer generated')
-            
+
             query_time = time.time() - start_time
             logger.info(f"Successfully answered question in {query_time:.2f}s")
-            
-            # Return the complete response
+
             return {
                 'success': True,
                 'answer': answer,
@@ -641,10 +596,11 @@ class SimplifiedRAG:
                 'metadata': {
                     'embedding_model': self.embedding_model,
                     'chat_model': self.chat_model,
-                    'top_k_used': top_k
+                    'top_k_used': top_k,
+                    'sub_queries_used': 2,
                 }
             }
-            
+
         except Exception as e:
             logger.error(f"FAILED to answer question '{question[:50]}...': {e}", exc_info=True)
             return {
