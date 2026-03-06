@@ -713,6 +713,133 @@ class SimplifiedRAG:
 
     
 
+    # =========================
+    # ADMIN / MANAGEMENT
+    # =========================
+
+    def add_single_qa(
+        self,
+        question: str,
+        answer: str,
+        category: str = "General",
+        section: str = "General",
+    ) -> Dict[str, Any]:
+        """Add a single Q&A pair to Pinecone."""
+        try:
+            doc_id = str(uuid.uuid4())
+            chunk_text = f"Q: {question}\nA: {answer}"
+            tokens = self.tokenizer.encode(chunk_text)
+            chunk = {
+                "text": chunk_text,
+                "question": question,
+                "answer": answer,
+                "section": section,
+                "category": category,
+                "token_count": len(tokens),
+                "char_count": len(chunk_text),
+                "chunk_index": 0,
+            }
+            embedding = self._generate_embeddings([chunk_text])[0]
+            result = self._upload_to_pinecone([chunk], [embedding], doc_id, "manual_entry")
+            logger.info(f"[ADMIN] Added Q&A pair (doc_id={doc_id})")
+            return {"success": True, "document_id": doc_id, **result}
+        except Exception as e:
+            logger.error(f"[ADMIN] Failed to add Q&A: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    def search_qa(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Search existing Q&A pairs by semantic similarity. Returns top_k results with vector IDs."""
+        try:
+            embedding = self._generate_embeddings([query])[0]
+            results = self.index.query(vector=embedding, top_k=top_k, include_metadata=True)
+            matches = []
+            for m in results["matches"]:
+                matches.append({
+                    "id": m["id"],
+                    "score": round(m["score"], 3),
+                    "question": m["metadata"].get("question", ""),
+                    "answer": m["metadata"].get("answer", ""),
+                    "category": m["metadata"].get("category", ""),
+                    "section": m["metadata"].get("section", ""),
+                    "filename": m["metadata"].get("filename", ""),
+                    "document_id": m["metadata"].get("document_id", ""),
+                })
+            logger.info(f"[ADMIN] search_qa({query[:60]}) → {len(matches)} results")
+            return matches
+        except Exception as e:
+            logger.error(f"[ADMIN] search_qa failed: {e}", exc_info=True)
+            return []
+
+    def update_qa(self, vector_id: str, new_answer: str, new_question: str | None = None) -> Dict[str, Any]:
+        """
+        Update an existing Q&A vector in Pinecone.
+        Re-embeds with new text and upserts.
+        """
+        try:
+            # Fetch current vector metadata
+            fetch_result = self.index.fetch(ids=[vector_id])
+            if vector_id not in fetch_result["vectors"]:
+                return {"success": False, "error": f"Vector {vector_id} not found"}
+
+            old_meta = fetch_result["vectors"][vector_id]["metadata"]
+            question = new_question if new_question else old_meta.get("question", "")
+            answer = new_answer
+
+            chunk_text = f"Q: {question}\nA: {answer}"
+            tokens = self.tokenizer.encode(chunk_text)
+
+            # Re-generate embedding
+            embedding = self._generate_embeddings([chunk_text])[0]
+
+            # Build updated metadata
+            updated_meta = {**old_meta}
+            updated_meta["question"] = question
+            updated_meta["answer"] = answer
+            updated_meta["text"] = chunk_text
+            updated_meta["token_count"] = len(tokens)
+            updated_meta["char_count"] = len(chunk_text)
+            updated_meta["updated_at"] = datetime.now().isoformat()
+
+            self.index.upsert(vectors=[{"id": vector_id, "values": embedding, "metadata": updated_meta}])
+            logger.info(f"[ADMIN] Updated vector {vector_id}")
+            return {"success": True, "vector_id": vector_id}
+        except Exception as e:
+            logger.error(f"[ADMIN] update_qa failed for {vector_id}: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    def bulk_add_qa(self, qa_pairs: List[Dict[str, str]], category: str = "General", section: str = "General") -> Dict[str, Any]:
+        """
+        Bulk-add a list of Q&A pairs.
+        Each item in qa_pairs must have 'question' and 'answer' keys.
+        """
+        try:
+            doc_id = str(uuid.uuid4())
+            chunks = []
+            for i, pair in enumerate(qa_pairs):
+                q = pair["question"].strip()
+                a = pair["answer"].strip()
+                chunk_text = f"Q: {q}\nA: {a}"
+                tokens = self.tokenizer.encode(chunk_text)
+                chunks.append({
+                    "text": chunk_text,
+                    "question": q,
+                    "answer": a,
+                    "section": section,
+                    "category": category,
+                    "token_count": len(tokens),
+                    "char_count": len(chunk_text),
+                    "chunk_index": i,
+                })
+
+            texts = [c["text"] for c in chunks]
+            embeddings = self._generate_embeddings(texts)
+            result = self._upload_to_pinecone(chunks, embeddings, doc_id, "bulk_upload")
+            logger.info(f"[ADMIN] Bulk-added {len(chunks)} Q&A pairs (doc_id={doc_id})")
+            return {"success": True, "document_id": doc_id, "pairs_added": len(chunks), **result}
+        except Exception as e:
+            logger.error(f"[ADMIN] bulk_add_qa failed: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
     # =================
     # UTILITY FUNCTIONS
     # =================

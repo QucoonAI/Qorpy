@@ -25,7 +25,7 @@ from mangum import Mangum
 
 # --- Local Application Imports ---
 from src.simplified_rag import SimplifiedRAG
-from src.models import QuestionRequest, response
+from src.models import QuestionRequest, AddQARequest, SearchQARequest, UpdateQARequest, response
 
 # --- Logger Setup ---
 logging.basicConfig(
@@ -423,3 +423,122 @@ async def ask_question(request: QuestionRequest):
             "responseCode": "01",
             "responseMessage": f"Unexpected error: {str(e)}"
         }
+
+
+# =========================
+# ADMIN ENDPOINTS
+# =========================
+
+@app.post("/add-qa", response_model=response)
+async def add_qa(request: AddQARequest):
+    """Add a single Q&A pair to the vector database."""
+    try:
+        if not rag_system:
+            return {"responseCode": "01", "responseMessage": "RAG system not initialized"}
+
+        result = rag_system.add_single_qa(
+            question=request.question,
+            answer=request.answer,
+            category=request.category or "General",
+            section=request.section or "General",
+        )
+        if result.get("success"):
+            return {
+                "responseCode": "00",
+                "responseMessage": "Q&A pair added successfully",
+                "data": result,
+            }
+        return {"responseCode": "01", "responseMessage": result.get("error", "Unknown error")}
+    except Exception as e:
+        logger.error(f"Error in /add-qa: {e}")
+        return {"responseCode": "01", "responseMessage": f"Failed: {str(e)}"}
+
+
+@app.post("/search-qa", response_model=response)
+async def search_qa(request: SearchQARequest):
+    """Search existing Q&A pairs by semantic similarity."""
+    try:
+        if not rag_system:
+            return {"responseCode": "01", "responseMessage": "RAG system not initialized"}
+
+        matches = rag_system.search_qa(query=request.query, top_k=request.top_k or 3)
+        return {
+            "responseCode": "00",
+            "responseMessage": f"Found {len(matches)} results",
+            "data": {"matches": matches},
+        }
+    except Exception as e:
+        logger.error(f"Error in /search-qa: {e}")
+        return {"responseCode": "01", "responseMessage": f"Failed: {str(e)}"}
+
+
+@app.post("/update-qa", response_model=response)
+async def update_qa(request: UpdateQARequest):
+    """Update an existing Q&A pair in the vector database."""
+    try:
+        if not rag_system:
+            return {"responseCode": "01", "responseMessage": "RAG system not initialized"}
+
+        result = rag_system.update_qa(
+            vector_id=request.vector_id,
+            new_answer=request.new_answer,
+            new_question=request.new_question,
+        )
+        if result.get("success"):
+            return {
+                "responseCode": "00",
+                "responseMessage": "Q&A pair updated successfully",
+                "data": result,
+            }
+        return {"responseCode": "01", "responseMessage": result.get("error", "Unknown error")}
+    except Exception as e:
+        logger.error(f"Error in /update-qa: {e}")
+        return {"responseCode": "01", "responseMessage": f"Failed: {str(e)}"}
+
+
+@app.post("/bulk-add-qa", response_model=response)
+async def bulk_add_qa(
+    file: UploadFile = File(...),
+    category: str = Form("General"),
+    section: str = Form("General"),
+):
+    """
+    Bulk-add Q&A pairs from an Excel file (.xlsx).
+    The file must have two columns: Question (col A) and Answer (col B).
+    """
+    try:
+        if not rag_system:
+            return {"responseCode": "01", "responseMessage": "RAG system not initialized"}
+
+        if not file.filename or not file.filename.lower().endswith(".xlsx"):
+            return {"responseCode": "01", "responseMessage": "Only .xlsx files are supported"}
+
+        import openpyxl
+        from io import BytesIO
+
+        file_bytes = await file.read()
+        wb = openpyxl.load_workbook(BytesIO(file_bytes), read_only=True)
+        ws = wb.active
+
+        qa_pairs = []
+        for row in ws.iter_rows(min_row=2, values_only=True):  # skip header row
+            q = str(row[0]).strip() if row[0] else ""
+            a = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+            if q and a:
+                qa_pairs.append({"question": q, "answer": a})
+        wb.close()
+
+        if not qa_pairs:
+            return {"responseCode": "01", "responseMessage": "No valid Q&A pairs found in the Excel file"}
+
+        result = rag_system.bulk_add_qa(qa_pairs, category=category, section=section)
+        if result.get("success"):
+            return {
+                "responseCode": "00",
+                "responseMessage": f"Successfully added {result.get('pairs_added', 0)} Q&A pairs",
+                "data": result,
+            }
+        return {"responseCode": "01", "responseMessage": result.get("error", "Unknown error")}
+    except Exception as e:
+        logger.error(f"Error in /bulk-add-qa: {e}")
+        return {"responseCode": "01", "responseMessage": f"Failed: {str(e)}"}

@@ -19,6 +19,27 @@ class QuestionRequest(BaseModel):
     """
     question: str  # The user's question to be sent to the RAG system.
     session_id: Optional[str] = None  # Session ID for conversation history (Redis)
+
+
+class AddQARequest(BaseModel):
+    """Data model for adding a single Q&A pair."""
+    question: str
+    answer: str
+    category: Optional[str] = "General"
+    section: Optional[str] = "General"
+
+
+class SearchQARequest(BaseModel):
+    """Data model for searching Q&A pairs."""
+    query: str
+    top_k: Optional[int] = 3
+
+
+class UpdateQARequest(BaseModel):
+    """Data model for updating an existing Q&A pair."""
+    vector_id: str
+    new_answer: str
+    new_question: Optional[str] = None
     
 
 class BaseResponse(BaseModel):

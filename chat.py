@@ -463,7 +463,11 @@ with st.sidebar:
     if st.button("＋ New Chat", type="secondary", use_container_width=True):
         create_new_chat()
         st.rerun()
-    
+
+    # Admin Page Button
+    if st.button("⚙️ Admin Panel", type="secondary", use_container_width=True):
+        st.switch_page("pages/admin.py")
+
     # History Section
     if st.session_state.conversations:
         st.markdown('<div class="sidebar-header">Recent</div>', unsafe_allow_html=True)
