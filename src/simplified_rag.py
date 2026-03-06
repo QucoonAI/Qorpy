@@ -30,8 +30,11 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file (searches current dir and all parents)
-load_dotenv(find_dotenv(usecwd=True) or find_dotenv())
+import pathlib
+
+# Always load from the .env file sitting next to this file's parent directory
+_env_file = pathlib.Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_file, override=True)
 
 class SimplifiedRAG:
     """Simplified RAG system with 4 core functions for backend integration"""
@@ -451,27 +454,35 @@ class SimplifiedRAG:
 
     def _generate_sub_queries(self, question: str) -> List[str]:
         """
-        Use Claude to silently break a user question into 2 focused sub-queries
-        for better retrieval coverage. Never exposed to the user.
+        Dynamically decompose a user question into 1–5 focused sub-queries.
+        - If the question contains logically distinct parts, split them.
+        - If parts are closely related (answer to one largely infers the other), keep as one.
+        - Never exposed to the user.
         """
         t0 = time.time()
         try:
             prompt = (
-                "Given the following user question, generate exactly 2 focused sub-queries "
-                "that would help retrieve relevant FAQ entries from a knowledge base about "
-                "FIRS e-Invoicing and Qucoon/Qorpy.\n\n"
-                "The sub-queries should:\n"
-                "- Cover different aspects of the question\n"
-                "- Be specific enough to match FAQ entries\n"
-                "- Be phrased as questions or search terms\n\n"
+                "Analyse the following user question and decompose it into the minimum number of "
+                "focused search queries needed to fully retrieve the answer from an FAQ knowledge base "
+                "about FIRS e-Invoicing and Qucoon/Qorpy.\n\n"
+                "Rules:\n"
+                "- If the question has only one clear topic, return a single query.\n"
+                "- If it contains 2 or more logically DISTINCT topics (where the answer to one "
+                "cannot be inferred from the other), split into separate queries — one per distinct topic.\n"
+                "- If sub-topics are closely related and the answer to one would largely cover the other, "
+                "keep them as one query.\n"
+                "- Return AT LEAST 1 and AT MOST 5 queries.\n"
+                "- Each query should be phrased as a specific question or search term.\n\n"
                 f"User question: {question}\n\n"
-                'Return ONLY a JSON array of 2 strings, nothing else. Example:\n'
-                '["sub-query 1 text", "sub-query 2 text"]'
+                "Return ONLY a JSON array of strings, nothing else. Examples:\n"
+                '["single focused query"]\n'
+                '["first distinct topic", "second distinct topic"]\n'
+                '["topic A", "topic B", "topic C"]'
             )
 
             request_body = json.dumps({
                 "messages": [{"role": "user", "content": [{"text": prompt}]}],
-                "inferenceConfig": {"maxTokens": 200}
+                "inferenceConfig": {"maxTokens": 300}
             })
 
             logger.info("[TIMING] Calling Bedrock for sub-query generation...")
@@ -483,26 +494,26 @@ class SimplifiedRAG:
 
             result = json.loads(response['body'].read())
             text = result['output']['message']['content'][0]['text'].strip()
-            # Strip markdown code fences if present (e.g. ```json ... ```)
+            # Strip markdown code fences if present
             json_match = re.search(r'\[.*?\]', text, re.DOTALL)
             if json_match:
                 text = json_match.group(0)
             sub_queries = json.loads(text)
-            if isinstance(sub_queries, list) and len(sub_queries) >= 2:
-                logger.info(f"[TIMING] Sub-query generation done in {time.time()-t0:.2f}s")
-                return sub_queries[:2]
+            if isinstance(sub_queries, list) and 1 <= len(sub_queries) <= 5:
+                logger.info(f"[TIMING] Sub-query generation done in {time.time()-t0:.2f}s | {len(sub_queries)} sub-queries: {sub_queries}")
+                return sub_queries
 
         except Exception as e:
             logger.warning(f"[TIMING] Sub-query generation failed after {time.time()-t0:.2f}s: {e}")
 
-        # Fallback: use original question for both slots
-        return [question, question]
+        # Fallback: use original question as single query
+        return [question]
 
     def ask_questions(self, question: str) -> Dict[str, Any]:
         """
         Ask a question with RAG retrieval using sub-query decomposition.
         """
-        top_k = 5
+        top_k = 2  # 2 chunks per sub-query; total context scales with number of sub-queries
         start_time = time.time()
 
         try:
@@ -514,7 +525,7 @@ class SimplifiedRAG:
             sub_queries = self._generate_sub_queries(question)
             logger.info(f"[TIMING] Step 1 - Sub-query generation: {time.time()-t1:.2f}s")
 
-            # Step 2: Embeddings + Pinecone retrieval — run both sub-queries in parallel
+            # Step 2: Embeddings + Pinecone retrieval — run all sub-queries in parallel
             def retrieve(idx: int, sq: str):
                 t2 = time.time()
                 embedding = self._generate_embeddings([sq])[0]
@@ -526,7 +537,7 @@ class SimplifiedRAG:
 
             t_retrieval = time.time()
             all_matches: Dict[str, Any] = {}
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            with ThreadPoolExecutor(max_workers=len(sub_queries)) as executor:
                 futures = {executor.submit(retrieve, idx, sq): idx for idx, sq in enumerate(sub_queries)}
                 for future in as_completed(futures):
                     for match in future.result():
@@ -624,7 +635,7 @@ Answer:"""
         Sub-query decomposition + retrieval happen upfront, then the answer streams.
         Yields raw text chunks from Bedrock's streaming API.
         """
-        top_k = 5
+        top_k = 2  # 2 chunks per sub-query; total context scales with number of sub-queries
         start_time = time.time()
 
         try:
@@ -635,7 +646,7 @@ Answer:"""
             sub_queries = self._generate_sub_queries(question)
             logger.info(f"[TIMING] Step 1 - Sub-query generation: {time.time()-t1:.2f}s")
 
-            # Step 2: Parallel retrieval
+            # Step 2: Parallel retrieval across all sub-queries
             def retrieve(idx: int, sq: str):
                 embedding = self._generate_embeddings([sq])[0]
                 results = self.index.query(vector=embedding, top_k=top_k, include_metadata=True)
@@ -643,7 +654,7 @@ Answer:"""
 
             t_retrieval = time.time()
             all_matches: Dict[str, Any] = {}
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            with ThreadPoolExecutor(max_workers=len(sub_queries)) as executor:
                 futures = {executor.submit(retrieve, idx, sq): idx for idx, sq in enumerate(sub_queries)}
                 for future in as_completed(futures):
                     for match in future.result():
