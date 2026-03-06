@@ -325,6 +325,23 @@ async def task_status(task_id: str):
     }
 
 
+@app.post("/create-session", response_model=response)
+async def create_session():
+    """
+    Generate a new session ID for conversation history.
+    Clients should call this once at the start of a conversation,
+    then pass the returned session_id with every /ask-question request.
+    """
+    session_id = str(uuid.uuid4())
+    return {
+        "responseCode": "00",
+        "responseMessage": "Session created successfully",
+        "data": {
+            "session_id": session_id,
+        }
+    }
+
+
 @app.post("/ask-question-stream")
 async def ask_question_stream(request: QuestionRequest):
     """
