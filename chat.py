@@ -376,12 +376,27 @@ st.markdown("""
 
 # ── API Function ───────────────────────────────────────────────────────────────
 
-def ask_question(question: str) -> str:
+def create_session() -> str | None:
+    """Call /create-session and return a new session_id, or None on failure."""
+    try:
+        r = requests.post(f"{API_URL}/create-session", timeout=15)
+        data = r.json()
+        if data.get("responseCode") == "00":
+            return data["data"]["session_id"]
+    except Exception:
+        pass
+    return None
+
+
+def ask_question(question: str, session_id: str | None = None) -> str:
     """Non-streaming fallback — used for suggestion chips."""
     try:
+        payload = {"question": question}
+        if session_id:
+            payload["session_id"] = session_id
         response = requests.post(
             f"{API_URL}/ask-question",
-            json={"question": question},
+            json=payload,
             timeout=60
         )
         data = response.json()
@@ -395,12 +410,15 @@ def ask_question(question: str) -> str:
         return f"❌ Connection error: {str(e)}"
 
 
-def ask_question_stream(question: str):
+def ask_question_stream(question: str, session_id: str | None = None):
     """Generator that yields answer text chunks from the SSE streaming endpoint."""
     try:
+        payload = {"question": question}
+        if session_id:
+            payload["session_id"] = session_id
         with requests.post(
             f"{API_URL}/ask-question-stream",
-            json={"question": question},
+            json=payload,
             stream=True,
             timeout=60
         ) as resp:
@@ -437,9 +455,10 @@ if "active_id" not in st.session_state:
 def create_new_chat():
     cid = datetime.now().strftime("%Y%m%d%H%M%S%f")
     st.session_state.conversations[cid] = {
-        "title": "New conversation", 
+        "title": "New conversation",
         "messages": [],
-        "timestamp": datetime.now()
+        "timestamp": datetime.now(),
+        "session_id": None,  # assigned when user clicks Start Session
     }
     st.session_state.active_id = cid
     return cid
@@ -467,6 +486,40 @@ with st.sidebar:
     # Admin Page Button
     if st.button("⚙️ Admin Panel", type="secondary", use_container_width=True):
         st.switch_page("pages/admin.py")
+
+    # ── Session Management ──────────────────────────────────────────────
+    st.markdown('<div class="sidebar-header">Session</div>', unsafe_allow_html=True)
+
+    _active_sid = st.session_state.conversations.get(
+        st.session_state.active_id, {}
+    ).get("session_id")
+
+    if _active_sid:
+        st.markdown(
+            f'<div style="font-size:12px;color:#aaa;word-break:break-all;padding:4px 0;">'
+            f'🟢 Active<br><span style="font-size:10px;opacity:0.6;">{_active_sid[:18]}…</span></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("↺ New Session", type="secondary", use_container_width=True, key="new_session_btn"):
+            new_sid = create_session()
+            if new_sid:
+                st.session_state.conversations[st.session_state.active_id]["session_id"] = new_sid
+                st.success("New session started")
+                st.rerun()
+            else:
+                st.error("Failed to create session")
+    else:
+        st.markdown(
+            '<div style="font-size:12px;color:#888;padding:4px 0;">⚪ No active session</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("▶ Start Session", type="primary", use_container_width=True, key="start_session_btn"):
+            new_sid = create_session()
+            if new_sid:
+                st.session_state.conversations[st.session_state.active_id]["session_id"] = new_sid
+                st.rerun()
+            else:
+                st.error("Could not reach the API — try again")
 
     # History Section
     if st.session_state.conversations:
@@ -562,13 +615,10 @@ if not messages:
     for i, suggestion in enumerate(suggestions):
         with suggestion_cols[i % 3]:
             if st.button(suggestion, key=f"sugg_{i}", use_container_width=True, type="secondary"):
-                # Simulate user sending this message
                 messages.append({"role": "user", "content": suggestion})
                 active_conv["title"] = suggestion[:40]
-                
-                # Get response immediately
                 with st.spinner(""):
-                    answer = ask_question(suggestion)
+                    answer = ask_question(suggestion, session_id=active_conv.get("session_id"))
                 messages.append({"role": "assistant", "content": answer})
                 st.rerun()
 
@@ -606,12 +656,13 @@ if prompt := st.chat_input("Message Qorpy...", key="chat_input"):
         st.markdown(prompt)
     
     # Stream or block depending on deployment target
+    _sid = active_conv.get("session_id")
     with st.chat_message("assistant"):
         if USE_STREAMING:
-            answer = st.write_stream(ask_question_stream(prompt))
+            answer = st.write_stream(ask_question_stream(prompt, session_id=_sid))
         else:
             with st.spinner("Thinking..."):
-                answer = ask_question(prompt)
+                answer = ask_question(prompt, session_id=_sid)
             st.markdown(answer)
 
     # Save assistant message
