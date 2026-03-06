@@ -40,6 +40,49 @@ st.markdown("""
     /* Sidebar */
     [data-testid="stSidebar"] { background-color: #111111 !important; border-right: 1px solid #222 !important; }
 
+    /* Force ALL body text to be dark/readable */
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMain"],
+    .block-container,
+    .stMarkdown, .stMarkdown p, .stMarkdown span,
+    .stMarkdown h1, .stMarkdown h2, .stMarkdown h3,
+    p, span, label, div {
+        color: #111111 !important;
+    }
+
+    /* Tab labels */
+    [data-testid="stTabs"] button[role="tab"] p,
+    [data-testid="stTabs"] button[role="tab"] {
+        color: #111111 !important;
+    }
+
+    /* Form labels */
+    [data-testid="stTextInput"] label,
+    [data-testid="stTextArea"] label,
+    [data-testid="stFileUploader"] label,
+    .stForm label {
+        color: #111111 !important;
+        font-weight: 500 !important;
+    }
+
+    /* Input & textarea text */
+    [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea {
+        color: #111111 !important;
+        background: #ffffff !important;
+    }
+
+    /* Caption / subtext */
+    [data-testid="stCaptionContainer"] p,
+    .stCaption, small {
+        color: #666666 !important;
+    }
+
+    /* Expander header */
+    [data-testid="stExpander"] summary p {
+        color: #111111 !important;
+    }
+
     /* Cards */
     .admin-card {
         background: #ffffff;
@@ -49,7 +92,7 @@ st.markdown("""
         margin-bottom: 1.25rem;
         box-shadow: 0 1px 4px rgba(0,0,0,0.04);
     }
-    .admin-card h3 { margin-top: 0; color: #111; }
+    .admin-card h3 { margin-top: 0; color: #111111 !important; }
 
     /* Section label */
     .section-label {
@@ -69,9 +112,9 @@ st.markdown("""
         padding: 1rem 1.25rem;
         margin-bottom: 0.75rem;
     }
-    .result-card .score { font-size: 12px; color: #888; }
-    .result-card .question { font-weight: 600; color: #111; margin: 4px 0; }
-    .result-card .answer   { color: #444; font-size: 14px; line-height: 1.6; }
+    .result-card .score    { font-size: 12px; color: #888; }
+    .result-card .question { font-weight: 600; color: #111111; margin: 4px 0; }
+    .result-card .answer   { color: #444444; font-size: 14px; line-height: 1.6; }
 </style>
 """, unsafe_allow_html=True)
 
