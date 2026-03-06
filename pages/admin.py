@@ -192,17 +192,22 @@ with tab_add:
 with tab_search:
     st.markdown('<div class="admin-card">', unsafe_allow_html=True)
     st.markdown("### Search & Edit Existing Q&A")
-    st.caption("Search by question text. The top 3 most similar results will appear below for editing.")
+    st.caption("Type a question exactly as a user would ask it. The top 3 closest matching Q&A pairs will appear with their current answers — click **Edit** to update any of them.")
 
-    search_query = st.text_input("Search question…", key="search_q", placeholder="Type a question to find…")
-    search_btn = st.button("Search", type="primary", use_container_width=True, key="search_btn")
+    search_query = st.text_input(
+        "Question",
+        key="search_q",
+        placeholder="e.g. How do I generate an e-Invoice?",
+        label_visibility="collapsed",
+    )
+    search_btn = st.button("🔍 Find Matching Q&A", type="primary", use_container_width=True, key="search_btn")
 
     # Keep results in session state so they persist across edits
     if "search_results" not in st.session_state:
         st.session_state.search_results = []
 
     if search_btn and search_query.strip():
-        with st.spinner("Searching…"):
+        with st.spinner("Finding closest matches…"):
             try:
                 resp = requests.post(
                     f"{API_URL}/search-qa",
@@ -219,16 +224,20 @@ with tab_search:
                 st.error(f"Connection error: {e}")
                 st.session_state.search_results = []
 
-    # Display results with editable answer fields
+    # Display results — show full Q&A, edit inline
     for idx, match in enumerate(st.session_state.search_results):
+        score_pct = int(match['score'] * 100)
+        category = match.get('category', '') or 'General'
+
         st.markdown(f"""
         <div class="result-card">
-            <span class="score">Score: {match['score']} &nbsp;|&nbsp; Category: {match.get('category', '')} &nbsp;|&nbsp; Section: {match.get('section', '')}</span>
+            <span class="score">Match {idx+1} &nbsp;·&nbsp; {score_pct}% relevance &nbsp;·&nbsp; {category}</span>
             <div class="question">Q: {match['question']}</div>
+            <div class="answer">A: {match['answer']}</div>
         </div>
         """, unsafe_allow_html=True)
 
-        with st.expander(f"Edit answer #{idx + 1}", expanded=False):
+        with st.expander(f"✏️ Edit this answer", expanded=False):
             new_q = st.text_input(
                 "Question",
                 value=match["question"],
@@ -237,17 +246,17 @@ with tab_search:
             new_a = st.text_area(
                 "Answer",
                 value=match["answer"],
-                height=140,
+                height=180,
                 key=f"edit_a_{idx}",
+                help="Edit the answer then click Update — it will be re-embedded and saved to Pinecone.",
             )
             if st.button("Update", key=f"update_btn_{idx}", type="primary", use_container_width=True):
-                with st.spinner("Updating…"):
+                with st.spinner("Re-embedding and saving…"):
                     try:
                         payload = {
                             "vector_id": match["id"],
                             "new_answer": new_a.strip(),
                         }
-                        # Only send new_question if it changed
                         if new_q.strip() != match["question"]:
                             payload["new_question"] = new_q.strip()
 
@@ -258,8 +267,7 @@ with tab_search:
                         )
                         data = resp.json()
                         if data.get("responseCode") == "00":
-                            st.success("Updated ✓")
-                            # Refresh the stored result so the card shows new values
+                            st.success("✓ Updated — the chatbot will use the new answer immediately.")
                             st.session_state.search_results[idx]["answer"] = new_a.strip()
                             if new_q.strip() != match["question"]:
                                 st.session_state.search_results[idx]["question"] = new_q.strip()
