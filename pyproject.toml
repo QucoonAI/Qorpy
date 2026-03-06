@@ -20,7 +20,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "redis>=7.2.1",
     "requests>=2.32.5",
-    "streamlit>=1.9.0",
+    "streamlit>=1.45.0",
     "tiktoken>=0.7.0",
     "uvicorn==0.35.0",
 ]
