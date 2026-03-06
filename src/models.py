@@ -6,7 +6,7 @@ request and response bodies in the FastAPI application.
 """
 
 from typing import Any, Optional, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field 
 
 # Request/Response models
 class QuestionRequest(BaseModel):
@@ -18,6 +18,7 @@ class QuestionRequest(BaseModel):
     and that its value is a string.
     """
     question: str  # The user's question to be sent to the RAG system.
+    session_id: Optional[str] = None  # Session ID for conversation history (Redis)
     
 
 class BaseResponse(BaseModel):

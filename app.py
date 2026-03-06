@@ -121,7 +121,7 @@ async def insert_doc_vector_db(
                 logger.info(f"Starting background add for doc_id: {doc_id}")
                 result = rag_system.add_to_existing_collection(
                     file_bytes=file_bytes,
-                    filename=doc_id
+                    filename=file.filename
                 )
                 if result.get('success'):
                     tasks[task_id]["status"] = "done"
@@ -203,7 +203,7 @@ async def replace_document_vectors_endpoint(
                 logger.info(f"Starting background replace for {doc_id}")
                 result = rag_system.replace_specific_document_vectors(
                     file_bytes=file_bytes,
-                    filename=doc_id
+                    filename=file.filename
                 )
                 if result.get('success'):
                     tasks[task_id]["status"] = "done"
@@ -370,14 +370,27 @@ async def ask_question(request: QuestionRequest):
             }
 
         logger.info(f"Processing question: '{request.question[:50]}...'")
-        result = rag_system.ask_questions(question=request.question)
+        result = rag_system.ask_questions(question=request.question, session_id=request.session_id)
 
         if result.get("success"):
             logger.info("Successfully answered question.")
+            # Return only what the frontend needs
+            sources = [
+                {
+                    "filename": s.get("filename", ""),
+                    "category": s.get("category", ""),
+                    "section": s.get("section", ""),
+                    "relevance_score": s.get("relevance_score", 0),
+                }
+                for s in result.get("sources", [])
+            ]
             return {
                 "responseCode": "00",
                 "responseMessage": "Question answered successfully",
-                "data": result
+                "data": {
+                    "answer": result.get("answer"),
+                    "sources": sources,
+                }
             }
         else:
             error_message = result.get("error", "Unknown error")
@@ -385,7 +398,6 @@ async def ask_question(request: QuestionRequest):
             return {
                 "responseCode": "01",
                 "responseMessage": f"Question processing failed: {error_message}",
-                "data": result
             }
 
     except Exception as e:

@@ -16,6 +16,8 @@ import uuid
 import time
 import json
 import logging
+import yaml
+import redis
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Optional, Any
@@ -36,6 +38,69 @@ import pathlib
 _env_file = pathlib.Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_file, override=True)
 
+# Force-read critical values directly from .env to bypass persistent shell env vars
+def _read_env_value(key: str) -> str | None:
+    """Read a value directly from the .env file, bypassing os.environ."""
+    if _env_file.exists():
+        for line in _env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() == key:
+                v = v.strip().strip('"').strip("'")  # strip surrounding quotes
+                return v if v else None
+    return None
+
+_pinecone_index_from_file = _read_env_value("PINECONE_INDEX_NAME")
+if _pinecone_index_from_file:
+    os.environ["PINECONE_INDEX_NAME"] = _pinecone_index_from_file
+
+_redis_url_from_file = _read_env_value("REDIS_URL")
+if _redis_url_from_file:
+    os.environ["REDIS_URL"] = _redis_url_from_file
+    logging.getLogger(__name__).info(f"[CONFIG] REDIS_URL loaded from .env (length={len(_redis_url_from_file)})")
+else:
+    logging.getLogger(__name__).warning("[CONFIG] REDIS_URL not found in .env file")
+
+
+class ConversationMemory:
+    """Manages per-session conversation history in Upstash Redis."""
+
+    TTL = 1800        # 30 minutes in seconds
+    MAX_MESSAGES = 5  # last 5 user+assistant pairs stored
+
+    def __init__(self, redis_url: str):
+        self.client = redis.from_url(redis_url, decode_responses=True)
+        logger.info("[CONFIG] Connected to Upstash Redis")
+
+    def _key(self, session_id: str) -> str:
+        return f"session:{session_id}:history"
+
+    def get_history(self, session_id: str) -> List[Dict[str, str]]:
+        """Return the last MAX_MESSAGES * 2 entries (user+assistant turns)."""
+        try:
+            raw = self.client.lrange(self._key(session_id), -(self.MAX_MESSAGES * 2), -1)
+            return [json.loads(m) for m in raw]
+        except Exception as e:
+            logger.warning(f"[REDIS] Failed to get history for session {session_id}: {e}")
+            return []
+
+    def save(self, session_id: str, user_msg: str, assistant_msg: str):
+        """Append user + assistant messages, trim to window, refresh TTL."""
+        try:
+            key = self._key(session_id)
+            pipe = self.client.pipeline()
+            pipe.rpush(key, json.dumps({"role": "user",      "content": user_msg}))
+            pipe.rpush(key, json.dumps({"role": "assistant", "content": assistant_msg}))
+            pipe.ltrim(key, -(self.MAX_MESSAGES * 2), -1)  # keep last N pairs
+            pipe.expire(key, self.TTL)
+            pipe.execute()
+            logger.info(f"[REDIS] Saved conversation turn for session {session_id}")
+        except Exception as e:
+            logger.warning(f"[REDIS] Failed to save history for session {session_id}: {e}")
+
+
 class SimplifiedRAG:
     """Simplified RAG system with 4 core functions for backend integration"""
         
@@ -51,6 +116,7 @@ class SimplifiedRAG:
             # Pinecone setup
             pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
             self.index_name = os.getenv('PINECONE_INDEX_NAME')
+            logger.info(f"[CONFIG] Pinecone index: {self.index_name!r}")
             
             # Create index if it doesn't exist
             if self.index_name not in [index.name for index in pc.list_indexes()]:
@@ -67,9 +133,26 @@ class SimplifiedRAG:
             
             # Model configurations
             self.embedding_model = "amazon.titan-embed-text-v2:0"  # Embedding model (512-dim)
-            self.chat_model = "amazon.nova-lite-v1:0"  # LLM for answer synthesis
+            self.chat_model = "amazon.nova-pro-v1:0"  # LLM for answer synthesis
             self.fast_model = "amazon.nova-lite-v1:0"  # Fast LLM for sub-queries
-            
+
+            # Load prompt templates from prompt.yaml
+            _prompt_file = pathlib.Path(__file__).resolve().parent.parent / "prompt.yaml"
+            with open(_prompt_file, "r") as f:
+                _prompts = yaml.safe_load(f)
+            self.system_prompt = _prompts["system"].strip()
+            self.user_template = _prompts["user_template"].strip()
+            self.sub_query_template = _prompts["sub_query"].strip()
+            logger.info("[CONFIG] Loaded prompt templates from prompt.yaml")
+
+            # Redis conversation memory (Upstash)
+            _redis_url = _redis_url_from_file or os.getenv("REDIS_URL")
+            if _redis_url:
+                self.memory = ConversationMemory(_redis_url)
+            else:
+                self.memory = None
+                logger.warning("[CONFIG] REDIS_URL not set — conversation history disabled")
+
             # Tokenizer for chunking (matches Claude models)
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
             
@@ -451,38 +534,18 @@ class SimplifiedRAG:
                 }
             }
     
-
     def _generate_sub_queries(self, question: str) -> List[str]:
         """
-        Dynamically decompose a user question into 1–5 focused sub-queries.
-        - If the question contains logically distinct parts, split them.
-        - If parts are closely related (answer to one largely infers the other), keep as one.
-        - Never exposed to the user.
+        Dynamically decompose a user question into 1-5 sub-queries using only
+        the exact words from the original question — no rephrasing or added context.
         """
         t0 = time.time()
         try:
-            prompt = (
-                "Analyse the following user question and decompose it into the minimum number of "
-                "focused search queries needed to fully retrieve the answer from an FAQ knowledge base "
-                "about FIRS e-Invoicing and Qucoon/Qorpy.\n\n"
-                "Rules:\n"
-                "- If the question has only one clear topic, return a single query.\n"
-                "- If it contains 2 or more logically DISTINCT topics (where the answer to one "
-                "cannot be inferred from the other), split into separate queries — one per distinct topic.\n"
-                "- If sub-topics are closely related and the answer to one would largely cover the other, "
-                "keep them as one query.\n"
-                "- Return AT LEAST 1 and AT MOST 5 queries.\n"
-                "- Each query should be phrased as a specific question or search term.\n\n"
-                f"User question: {question}\n\n"
-                "Return ONLY a JSON array of strings, nothing else. Examples:\n"
-                '["single focused query"]\n'
-                '["first distinct topic", "second distinct topic"]\n'
-                '["topic A", "topic B", "topic C"]'
-            )
+            prompt = self.sub_query_template.format(user_query=question)
 
             request_body = json.dumps({
                 "messages": [{"role": "user", "content": [{"text": prompt}]}],
-                "inferenceConfig": {"maxTokens": 300}
+                "inferenceConfig": {"maxTokens": 200}
             })
 
             logger.info("[TIMING] Calling Bedrock for sub-query generation...")
@@ -509,11 +572,12 @@ class SimplifiedRAG:
         # Fallback: use original question as single query
         return [question]
 
-    def ask_questions(self, question: str) -> Dict[str, Any]:
+    def ask_questions(self, question: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Ask a question with RAG retrieval using sub-query decomposition.
+        Optionally maintains conversation history per session via Redis.
         """
-        top_k = 2  # 2 chunks per sub-query; total context scales with number of sub-queries
+        top_k = 3  # 3 chunks per sub-query; total context scales with number of sub-queries
         start_time = time.time()
 
         try:
@@ -524,6 +588,7 @@ class SimplifiedRAG:
             t1 = time.time()
             sub_queries = self._generate_sub_queries(question)
             logger.info(f"[TIMING] Step 1 - Sub-query generation: {time.time()-t1:.2f}s")
+            logger.info(f"[SUB-QUERIES] {len(sub_queries)} query(s): {sub_queries}")
 
             # Step 2: Embeddings + Pinecone retrieval — run all sub-queries in parallel
             def retrieve(idx: int, sq: str):
@@ -546,6 +611,8 @@ class SimplifiedRAG:
 
             unique_matches = sorted(all_matches.values(), key=lambda m: m['score'], reverse=True)
             logger.info(f"[TIMING] Step 2 total - Parallel retrieval complete in {time.time()-t_retrieval:.2f}s | {len(unique_matches)} unique chunks")
+            for i, m in enumerate(unique_matches):
+                logger.info(f"[RETRIEVED {i+1}] score={m['score']:.3f} | category={m['metadata'].get('category','')} | Q: {m['metadata'].get('question','')[:100]}")
 
             # Step 3: Build context and sources
             context_chunks = []
@@ -564,28 +631,39 @@ class SimplifiedRAG:
 
             context_text = "\n\n".join(context_chunks)
 
-            # Step 4: Answer synthesis
-            prompt = f"""You are the Qorpy FAQ assistant — an expert on FIRS e-Invoicing, Qucoon, and the Qorpy platform. Answer the user's question clearly and directly using only the context provided.
+            # Short-circuit: no context retrieved
+            if not unique_matches:
+                logger.warning("[RAG] No chunks retrieved — returning fallback answer")
+                return {
+                    'success': True,
+                    'answer': "I don't have details on that — contact support@qucoon.com",
+                    'sources': [],
+                    'question': question,
+                    'query_time_seconds': round(time.time() - start_time, 2),
+                    'chunks_retrieved': 0,
+                    'sub_queries_used': len(sub_queries),
+                }
 
-Context:
-{context_text}
+            # Step 4: Answer synthesis using prompt.yaml templates
+            user_message = self.user_template.format(
+                context=context_text,
+                question=question,
+            )
 
-User's Question: {question}
-
-Formatting rules (follow strictly):
-- Write in plain, confident prose — no filler phrases like "Great question!" or "Based on the context"
-- Keep answers short and scannable. Use bullet points or numbered lists when listing multiple items
-- Use **bold** for key terms, names, or important values
-- If the answer has a single clear fact, give it in 1-2 sentences — do not pad
-- If information is truly missing from the context, say so in one line: "I don't have details on that — contact support@qucoon.com"
-- Never start your reply with "I" as the first word
-- Do not repeat the question back to the user
-
-Answer:"""
+            # Build messages array: conversation history + current turn
+            history = self.memory.get_history(session_id) if (self.memory and session_id) else []
+            if history:
+                logger.info(f"[REDIS] Injecting {len(history)} history messages for session {session_id}")
+            messages = [
+                {"role": m["role"], "content": [{"text": m["content"]}]}
+                for m in history
+            ]
+            messages.append({"role": "user", "content": [{"text": user_message}]})
 
             request_body = json.dumps({
-                "messages": [{"role": "user", "content": [{"text": prompt}]}],
-                "inferenceConfig": {"maxTokens": 800}
+                "system": [{"text": self.system_prompt}],
+                "messages": messages,
+                "inferenceConfig": {"maxTokens": 1000},
             })
 
             t4 = time.time()
@@ -599,6 +677,10 @@ Answer:"""
             result = json.loads(response['body'].read())
             answer = result['output']['message']['content'][0]['text']
             logger.info(f"[TIMING] Step 4 - Answer synthesis done: {time.time()-t4:.2f}s")
+
+            # Save this turn to Redis
+            if self.memory and session_id:
+                self.memory.save(session_id, question, answer)
 
             total_time = time.time() - start_time
             logger.info(f"[TIMING] ========== TOTAL: {total_time:.2f}s ==========")
@@ -614,7 +696,7 @@ Answer:"""
                     'embedding_model': self.embedding_model,
                     'chat_model': self.chat_model,
                     'top_k_used': top_k,
-                    'sub_queries_used': 2,
+                    'sub_queries_used': len(sub_queries),
                 }
             }
 
@@ -629,94 +711,7 @@ Answer:"""
             }
     
 
-    def ask_questions_stream(self, question: str):
-        """
-        Ask a question with RAG retrieval, streaming the answer token by token.
-        Sub-query decomposition + retrieval happen upfront, then the answer streams.
-        Yields raw text chunks from Bedrock's streaming API.
-        """
-        top_k = 2  # 2 chunks per sub-query; total context scales with number of sub-queries
-        start_time = time.time()
-
-        try:
-            logger.info(f"[TIMING] ========== START ask_questions_stream ==========")
-
-            # Step 1: Sub-query generation
-            t1 = time.time()
-            sub_queries = self._generate_sub_queries(question)
-            logger.info(f"[TIMING] Step 1 - Sub-query generation: {time.time()-t1:.2f}s")
-
-            # Step 2: Parallel retrieval across all sub-queries
-            def retrieve(idx: int, sq: str):
-                embedding = self._generate_embeddings([sq])[0]
-                results = self.index.query(vector=embedding, top_k=top_k, include_metadata=True)
-                return results['matches']
-
-            t_retrieval = time.time()
-            all_matches: Dict[str, Any] = {}
-            with ThreadPoolExecutor(max_workers=len(sub_queries)) as executor:
-                futures = {executor.submit(retrieve, idx, sq): idx for idx, sq in enumerate(sub_queries)}
-                for future in as_completed(futures):
-                    for match in future.result():
-                        if match['id'] not in all_matches:
-                            all_matches[match['id']] = match
-
-            unique_matches = sorted(all_matches.values(), key=lambda m: m['score'], reverse=True)
-            logger.info(f"[TIMING] Step 2 - Parallel retrieval: {time.time()-t_retrieval:.2f}s | {len(unique_matches)} unique chunks")
-
-            # Step 3: Build context
-            context_text = "\n\n".join(m['metadata']['text'] for m in unique_matches)
-
-            # Step 4: Stream answer synthesis
-            prompt = f"""You are the Qorpy FAQ assistant — an expert on FIRS e-Invoicing, Qucoon, and the Qorpy platform. Answer the user's question clearly and directly using only the context provided.
-
-Context:
-{context_text}
-
-User's Question: {question}
-
-Formatting rules (follow strictly):
-- Write in plain, confident prose — no filler phrases like "Great question!" or "Based on the context"
-- Keep answers short and scannable. Use bullet points or numbered lists when listing multiple items
-- Use **bold** for key terms, names, or important values
-- If the answer has a single clear fact, give it in 1-2 sentences — do not pad
-- If information is truly missing from the context, say so in one line: "I don't have details on that — contact support@qucoon.com"
-- Never start your reply with "I" as the first word
-- Do not repeat the question back to the user
-
-Answer:"""
-
-            request_body = json.dumps({
-                "messages": [{"role": "user", "content": [{"text": prompt}]}],
-                "inferenceConfig": {"maxTokens": 800}
-            })
-
-            t4 = time.time()
-            logger.info("[TIMING] Step 4 - Starting streaming synthesis...")
-            response = self.bedrock.invoke_model_with_response_stream(
-                modelId=self.chat_model,
-                body=request_body,
-                contentType='application/json'
-            )
-
-            stream = response.get('body')
-            if stream:
-                for event in stream:
-                    chunk = event.get('chunk')
-                    if chunk:
-                        chunk_data = json.loads(chunk.get('bytes').decode())
-                        # Nova Lite streaming format
-                        if 'contentBlockDelta' in chunk_data:
-                            delta = chunk_data['contentBlockDelta'].get('delta', {})
-                            if 'text' in delta:
-                                yield delta['text']
-
-            logger.info(f"[TIMING] Step 4 - Streaming done: {time.time()-t4:.2f}s")
-            logger.info(f"[TIMING] ========== STREAM TOTAL: {time.time()-start_time:.2f}s ==========")
-
-        except Exception as e:
-            logger.error(f"FAILED to stream answer for '{question[:50]}': {e}", exc_info=True)
-            yield f"\n\n⚠️ Something went wrong. Please try again."
+    
 
     # =================
     # UTILITY FUNCTIONS
