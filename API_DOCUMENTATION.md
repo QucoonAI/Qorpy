@@ -1,47 +1,92 @@
-# Qorpy RAG FAQ - Frontend API Integration Guide
+# Qorpy RAG — Frontend API Integration Guide
 
-This document is for the frontend engineering team. It explains how to integrate the FastAPI/AWS Lambda backend into both the **End-User Chat Interface** and the **Admin Dashboard**.
-
-## 🚀 Quick Start & Integration Workflows
-
-The API is divided into two main parts based on what you are building:
-
-### 1. Building the Chatbot (End-User UI)
-You only need two endpoints for the core chat experience:
-1. **Initialize Chat:** When the chat widget opens, call `/create-session` to get a `session_id`.
-2. **Send Messages:** When the user sends a message, call `/ask-question` with the user's text and the `session_id`. 
-
-
-### 2. Building the Admin Dashboard (Content Management UI)
-For the admin panel where your team manages the AI's knowledge:
-*   **Uploading PDFs:** Use `/insert-doc-vector-db`. This returns a `task_id`. Use `/task-status/{task_id}` to poll until the upload finishes.
-*   **Managing Manual Q&As:** Use `/add-qa`, `/update-qa`, `/search-qa`, and `/bulk-add-qa` to directly manage specific question-answer pairs without PDFs.
-*   **Metrics:** Use `/stats` to show how many documents are currently indexed.
+> This document is intended for the frontend engineering team. It covers how to integrate the FastAPI/AWS Lambda backend into the **End-User Chat Interface** and the **Admin Dashboard**.
 
 ---
 
-## 🌐 Base Information
+## Table of Contents
 
-*   **Base URL:** `https://gij3liro3kouweizzludyyhbe40dsxcw.lambda-url.us-east-1.on.aws` 
-    *(Note: You can view the swagger UI by visiting the `/docs` path, but use the base URL for API calls)*
-*   **Standard Response Format:** almost all endpoints return this JSON structure:
-    ```json
-    {
-      "responseCode": "00", // "00" = Success, "01" = Error
-      "responseMessage": "Human readable message describing the result",
-      "data": {} // The actual payload (optional)
-    }
-    ```
+1. [Base Information](#base-information)
+2. [Quick Start Workflows](#quick-start-workflows)
+3. [Standard Response Format](#standard-response-format)
+4. [Chat Interface Endpoints](#chat-interface-endpoints)
+   - [Create a Chat Session](#create-a-chat-session)
+   - [Ask a Question](#ask-a-question)
+5. [Admin & Document Management Endpoints](#admin--document-management-endpoints)
+   - [Upload a PDF Document](#upload-a-pdf-document)
+   - [Check Background Task Status](#check-background-task-status)
+   - [Get System Stats](#get-system-stats)
+   - [Replace an Existing Document](#replace-an-existing-document)
+   - [Wipe Database](#wipe-database)
+6. [Manual Q&A Management Endpoints](#manual-qa-management-endpoints)
+   - [Search Existing Q&As](#search-existing-qas)
+   - [Add a Single Q&A](#add-a-single-qa)
+   - [Update a Q&A](#update-a-qa)
+   - [Bulk Add from Excel](#bulk-add-from-excel)
 
 ---
 
-## 💬 1. Chat Interface Endpoints
+## Base Information
 
-### 1.1 Create a Chat Session
+| Property | Value |
+|---|---|
+| **Base URL** | `https://gij3liro3kouweizzludyyhbe40dsxcw.lambda-url.us-east-1.on.aws` |
+| **Swagger UI** | `{Base URL}/docs` (for reference only — do not use for API calls) |
+| **Content Types** | `application/json` or `multipart/form-data` (per endpoint) |
+
+---
+
+## Quick Start Workflows
+
+### Building the Chat Interface
+
+When implementing the end-user chat widget, only two endpoints are required:
+
+1. **On widget open** — Call `POST /create-session` to obtain a `session_id`.
+2. **On message send** — Call `POST /ask-question` with the user's message and the active `session_id`.
+
+### Building the Admin Dashboard
+
+For the content management panel:
+
+| Goal | Endpoints |
+|---|---|
+| Upload and train on a PDF | `POST /insert-doc-vector-db` → poll `GET /task-status/{task_id}` |
+| Manage manual Q&A entries | `POST /add-qa`, `POST /update-qa`, `POST /search-qa`, `POST /bulk-add-qa` |
+| View indexed document metrics | `GET /stats` |
+
+---
+
+## Standard Response Format
+
+Nearly all endpoints return a consistent JSON envelope:
+
+```json
+{
+  "responseCode": "00",
+  "responseMessage": "Human readable message describing the result",
+  "data": {}
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `responseCode` | `string` | `"00"` indicates success; `"01"` indicates an error |
+| `responseMessage` | `string` | A human-readable description of the result |
+| `data` | `object` | The response payload (may be omitted on some responses) |
+
+---
+
+## Chat Interface Endpoints
+
+### Create a Chat Session
+
 **`POST /create-session`**
-Call this once when a user opens the chat to establish conversation memory.
 
-**Response:**
+Initializes a new conversation session. Call this once when the chat widget is opened to enable conversation memory across messages.
+
+**Response**
+
 ```json
 {
   "responseCode": "00",
@@ -52,19 +97,38 @@ Call this once when a user opens the chat to establish conversation memory.
 }
 ```
 
-### 1.2 Ask a Question (Standard)
-**`POST /ask-question`**
-Send a user's message to the AI.
+Store the returned `session_id` and attach it to every subsequent `/ask-question` request.
 
-**Headers:** `Content-Type: application/json`
-**Request Body:**
+---
+
+### Ask a Question
+
+**`POST /ask-question`**
+
+Sends the user's message to the AI and returns an answer with source references.
+
+**Headers**
+
+```
+Content-Type: application/json
+```
+
+**Request Body**
+
 ```json
 {
   "question": "What is the refund policy?",
-  "session_id": "123e4567-e89b-12d3-a456-426614174000" // Use the ID from /create-session
+  "session_id": "123e4567-e89b-12d3-a456-426614174000"
 }
 ```
-**Response:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `question` | `string` | Yes | The user's message |
+| `session_id` | `string` | Yes | Session ID obtained from `/create-session` |
+
+**Response**
+
 ```json
 {
   "responseCode": "00",
@@ -83,24 +147,35 @@ Send a user's message to the AI.
 }
 ```
 
+---
 
+## Admin & Document Management Endpoints
 
-## ⚙️ 2. Admin & Document Management Endpoints
+### Upload a PDF Document
 
-### 2.1 Upload a PDF Document
 **`POST /insert-doc-vector-db`**
-Uploads a PDF, extracts data, and trains the AI. Because this can take time, it runs in the background.
 
-**Headers:** `Content-Type: multipart/form-data`
-**Request Form Data:**
-*   `doc_id` (Text): A unique string/ID for this document.
-*   `file` (File): The PDF file (Max 10MB).
+Uploads a PDF file, extracts its content, and trains the AI against it. Processing runs as a background task. Use `/task-status/{task_id}` to track progress.
 
-**Response:**
+**Headers**
+
+```
+Content-Type: multipart/form-data
+```
+
+**Request Form Data**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `doc_id` | `string` | Yes | A unique identifier for this document |
+| `file` | `file` | Yes | The PDF file to upload (max 10 MB) |
+
+**Response**
+
 ```json
 {
   "responseCode": "00",
-  "responseMessage": "Background task started...",
+  "responseMessage": "Background task started",
   "data": {
     "doc_id": "doc_123",
     "task_id": "task-uuid-here",
@@ -109,70 +184,114 @@ Uploads a PDF, extracts data, and trains the AI. Because this can take time, it 
 }
 ```
 
-### 2.2 Check Background Task Status
-**`GET /task-status/{task_id}`**
-Poll this endpoint (e.g., every 3 seconds) after uploading a PDF to show a loading spinner in the UI until it finishes.
+---
 
-**Path Parameter:** `task_id` (from the upload response)
-**Response:**
+### Check Background Task Status
+
+**`GET /task-status/{task_id}`**
+
+Returns the current status of a background task. Poll this endpoint (recommended interval: every 3 seconds) after a document upload to reflect progress in the UI.
+
+**Path Parameter**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `task_id` | `string` | The task ID returned by the upload endpoint |
+
+**Response**
+
 ```json
 {
   "responseCode": "00",
   "responseMessage": "Task status retrieved",
   "data": {
     "task_id": "task-uuid-here",
-    "status": "running", // Can be: "running", "done", or "failed"
+    "status": "running",
     "message": "Processing doc_123"
   }
 }
 ```
 
-### 2.3 Get System Stats
-**`GET /stats`**
-Fetch current database metrics and a list of all trained documents.
+| `status` Value | Meaning |
+|---|---|
+| `running` | Task is still in progress |
+| `done` | Task completed successfully |
+| `failed` | Task encountered an error |
 
-**Response:**
+---
+
+### Get System Stats
+
+**`GET /stats`**
+
+Returns current database metrics and a list of all indexed documents.
+
+**Response**
+
 ```json
 {
   "responseCode": "00",
   "responseMessage": "Database statistics fetched successfully",
   "data": {
-    "stats": { ... },
+    "stats": {},
     "document_count": 5,
     "documents": ["doc_123", "policy_2024"]
   }
 }
 ```
 
-### 2.4 Replace an Existing Document
+---
+
+### Replace an Existing Document
+
 **`POST /replace-document-vectors`**
-Deletes old training data for a specific document and uploads a new PDF.
 
-**Headers:** `Content-Type: multipart/form-data`
-**Request Form Data:**
-*   `doc_id` (Text): The ID of the document to replace.
-*   `confirm` (Text): Must literally be `"YES"`.
-*   `file` (File): The new PDF file.
+Deletes the existing training data for a given document and replaces it with a new PDF upload. Returns a `task_id` identical to the upload endpoint — poll `/task-status/{task_id}` to track completion.
 
-**(Returns a `task_id` just like the upload endpoint).**
+**Headers**
 
-### 2.5 Wipe Database (DANGER)
-**`POST /reset-vector-db`**
-Deletes ALL training data.
+```
+Content-Type: multipart/form-data
+```
 
-**Request Form Data:**
-*   `confirm` (Text): Must literally be `"YES"`.
+**Request Form Data**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `doc_id` | `string` | Yes | The ID of the document to replace |
+| `confirm` | `string` | Yes | Must be exactly `"YES"` to confirm the operation |
+| `file` | `file` | Yes | The new PDF file |
 
 ---
 
-## 📝 3. Admin Manual Q&A Management Endpoints
-*Use these endpoints to manually manage specific FAQs without needing a PDF.*
+### Wipe Database
 
-### 3.1 Search Existing Q&As
+**`POST /reset-vector-db`**
+
+> **Warning:** This action permanently deletes **all** training data from the vector database. It cannot be undone.
+
+**Request Form Data**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `confirm` | `string` | Yes | Must be exactly `"YES"` to confirm the operation |
+
+---
+
+## Manual Q&A Management Endpoints
+
+These endpoints allow the admin to manage specific question-answer pairs directly, without requiring a PDF upload.
+
+---
+
+### Search Existing Q&As
+
 **`POST /search-qa`**
-Search what the AI already knows directly in the admin panel.
 
-**Request Body (JSON):**
+Searches the AI's current knowledge base for entries matching a query. Useful for verifying existing content before adding duplicates.
+
+**Request Body**
+
 ```json
 {
   "query": "password reset",
@@ -180,37 +299,79 @@ Search what the AI already knows directly in the admin panel.
 }
 ```
 
-### 3.2 Add a Single Q&A
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `query` | `string` | Yes | The search term |
+| `top_k` | `integer` | No | Maximum number of results to return |
+
+---
+
+### Add a Single Q&A
+
 **`POST /add-qa`**
 
-**Request Body (JSON):**
+Adds a single question-answer pair to the knowledge base.
+
+**Request Body**
+
 ```json
 {
   "question": "How do I reset my password?",
   "answer": "Click 'Forgot password' on the login screen.",
-  "category": "Account", // Optional
-  "section": "Login" // Optional
+  "category": "Account",
+  "section": "Login"
 }
 ```
 
-### 3.3 Update a Q&A
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `question` | `string` | Yes | The question text |
+| `answer` | `string` | Yes | The answer text |
+| `category` | `string` | No | Category label for this entry |
+| `section` | `string` | No | Section label for this entry |
+
+---
+
+### Update a Q&A
+
 **`POST /update-qa`**
 
-**Request Body (JSON):**
+Updates an existing Q&A entry by its vector ID.
+
+**Request Body**
+
 ```json
 {
   "vector_id": "uuid-of-the-saved-vector",
-  "new_question": "Updated question?", 
-  "new_answer": "Updated answer text"
+  "new_question": "Updated question?",
+  "new_answer": "Updated answer text."
 }
 ```
 
-### 3.4 Bulk-Add from Excel (.xlsx)
-**`POST /bulk-add-qa`**
-Upload an Excel file (Col A = Questions, Col B = Answers. Row 1 is treated as headers and skipped).
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `vector_id` | `string` | Yes | The unique ID of the vector entry to update |
+| `new_question` | `string` | Yes | The replacement question text |
+| `new_answer` | `string` | Yes | The replacement answer text |
 
-**Headers:** `Content-Type: multipart/form-data`
-**Request Form Data:**
-*   `file` (File): The `.xlsx` file.
-*   `category` (Text, optional): Default category to assign these.
-*   `section` (Text, optional): Default section.
+---
+
+### Bulk Add from Excel
+
+**`POST /bulk-add-qa`**
+
+Accepts an `.xlsx` file and bulk-imports Q&A pairs. Column A must contain questions and Column B must contain answers. Row 1 is treated as a header row and will be skipped.
+
+**Headers**
+
+```
+Content-Type: multipart/form-data
+```
+
+**Request Form Data**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `file` | `file` | Yes | The `.xlsx` file to import |
+| `category` | `string` | No | Default category to assign all imported entries |
+| `section` | `string` | No | Default section to assign all imported entries |
