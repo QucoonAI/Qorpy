@@ -17,12 +17,19 @@ class QuestionRequest(BaseModel):
     It ensures that the JSON payload has a required 'question' field
     and that its value is a string.
     """
+    entity_id: str  # Tenant namespace — required on every request
     question: str  # The user's question to be sent to the RAG system.
     session_id: Optional[str] = None  # Session ID for conversation history (Redis)
 
 
+class CreateSessionRequest(BaseModel):
+    """Data model for the '/create-session' endpoint."""
+    entity_id: str  # Tenant namespace — required to scope the session
+
+
 class AddQARequest(BaseModel):
     """Data model for adding a single Q&A pair."""
+    entity_id: str
     question: str
     answer: str
     category: Optional[str] = "General"
@@ -31,12 +38,14 @@ class AddQARequest(BaseModel):
 
 class SearchQARequest(BaseModel):
     """Data model for searching Q&A pairs."""
+    entity_id: str
     query: str
     top_k: Optional[int] = 3
 
 
 class UpdateQARequest(BaseModel):
     """Data model for updating an existing Q&A pair."""
+    entity_id: str
     vector_id: str
     new_answer: str
     new_question: Optional[str] = None

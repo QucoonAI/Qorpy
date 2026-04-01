@@ -7,7 +7,13 @@ LAMBDA_URL = "https://gij3liro3kouweizzludyyhbe40dsxcw.lambda-url.us-east-1.on.a
 LOCAL_URL = "http://localhost:8000"
 
 # Toggle: set to LOCAL_URL for local dev, LAMBDA_URL for production
-API_URL = LAMBDA_URL
+API_URL = LOCAL_URL
+
+# ── Tenant Identity ────────────────────────────────────────────────────────────
+# The entity_id (Pinecone namespace) is passed via URL query parameter.
+# e.g., http://localhost:8501/?entity_id=qorpy-business
+# If none is provided, it defaults to a generic namespace.
+ENTITY_ID = st.query_params.get("entity_id", "default-tenant")
 
 # Streaming only works with local uvicorn (Mangum/Lambda doesn't support SSE)
 USE_STREAMING = API_URL == LOCAL_URL
@@ -25,7 +31,11 @@ st.set_page_config(
 def create_session() -> str | None:
     """Call /create-session and return a new session_id, or None on failure."""
     try:
-        r = requests.post(f"{API_URL}/create-session", timeout=15)
+        r = requests.post(
+            f"{API_URL}/create-session",
+            json={"entity_id": ENTITY_ID},
+            timeout=15,
+        )
         data = r.json()
         if data.get("responseCode") == "00":
             return data["data"]["session_id"]
@@ -37,7 +47,7 @@ def create_session() -> str | None:
 def ask_question(question: str, session_id: str | None = None) -> str:
     """Non-streaming fallback — used for suggestion chips."""
     try:
-        payload = {"question": question}
+        payload = {"entity_id": ENTITY_ID, "question": question}
         if session_id:
             payload["session_id"] = session_id
         response = requests.post(
@@ -59,7 +69,7 @@ def ask_question(question: str, session_id: str | None = None) -> str:
 def ask_question_stream(question: str, session_id: str | None = None):
     """Generator that yields answer text chunks from the SSE streaming endpoint."""
     try:
-        payload = {"question": question}
+        payload = {"entity_id": ENTITY_ID, "question": question}
         if session_id:
             payload["session_id"] = session_id
         with requests.post(

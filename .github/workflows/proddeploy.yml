@@ -72,15 +72,11 @@ jobs:
           aws iam create-role \
             --role-name ${{ secrets.LAMBDA_ROLE_NAME }} \
             --assume-role-policy-document file://trust-policy.json \
-            --description "Lambda execution role with S3 and Bedrock access"
+            --description "Lambda execution role with Bedrock access"
 
           aws iam attach-role-policy \
             --role-name ${{ secrets.LAMBDA_ROLE_NAME }} \
             --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-
-          aws iam attach-role-policy \
-            --role-name ${{ secrets.LAMBDA_ROLE_NAME }} \
-            --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
 
           aws iam attach-role-policy \
             --role-name ${{ secrets.LAMBDA_ROLE_NAME }} \
@@ -119,7 +115,6 @@ jobs:
             --environment "Variables={
               PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }},
               PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }},
-              S3_BUCKET_NAME=${{ secrets.S3_BUCKET_NAME }},
               ENVIRONMENT=${{ secrets.ENVIRONMENT || 'production' }}
             }"
 
@@ -147,7 +142,6 @@ jobs:
             "Variables": {
               "PINECONE_API_KEY": "${{ secrets.PINECONE_API_KEY }}",
               "PINECONE_INDEX_NAME": "${{ secrets.PINECONE_INDEX_NAME }}",
-              "S3_BUCKET_NAME": "${{ secrets.S3_BUCKET_NAME }}",
               "ENVIRONMENT": "${{ secrets.ENVIRONMENT || 'production' }}"
             }
           }
@@ -223,7 +217,7 @@ jobs:
 # ### Environment Variables (customize to your needs)
 # 7. `PINECONE_API_KEY` - Your API key
 # 8. `PINECONE_INDEX_NAME` - OpenAI API key
-# 9. `S3_BUCKET_NAME` - Database connection string
+
 # 10. `ENVIRONMENT` - Environment name (optional, defaults to production)
 
 # ### Optional

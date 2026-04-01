@@ -1,12 +1,23 @@
 """
-FastAPI Backend for Simplified RAG System
-=========================================
-REST API endpoints for the core RAG functions:
-1. POST /insert-doc-vector-db - Upload PDF & add to existing collection
+FastAPI Backend for Simplified RAG System (Multi-Tenant)
+=========================================================
+REST API endpoints for the core RAG functions.
+Every endpoint requires `entity_id` which maps to a Pinecone namespace,
+providing full tenant isolation.
+
+Endpoints:
+1. POST /insert-doc-vector-db    - Upload PDF & add to tenant namespace
 2. POST /replace-document-vectors - Replace vectors for a specific document
-3. POST /reset-vector-db - Wipe entire database
-4. POST /ask-question - Ask questions with RAG
-5. GET  /stats - Database statistics
+3. POST /reset-vector-db          - Wipe vectors in a specific namespace
+4. POST /create-session           - Generate a new session ID
+5. POST /ask-question             - Ask questions with RAG
+6. POST /ask-question-stream      - Stream answer via SSE
+7. GET  /stats                    - Database statistics (per-tenant or global)
+8. GET  /entities                 - List all known namespaces
+9. POST /add-qa                   - Add single Q&A pair
+10. POST /search-qa               - Search Q&A pairs
+11. POST /update-qa               - Update a Q&A pair
+12. POST /bulk-add-qa             - Bulk upload Q&A from Excel
 
 Direct PDF upload - no S3 dependency.
 """
@@ -19,13 +30,16 @@ import logging
 from typing import Optional
 
 # --- Third-Party Imports ---
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from mangum import Mangum
 
 # --- Local Application Imports ---
 from src.simplified_rag import SimplifiedRAG
-from src.models import QuestionRequest, AddQARequest, SearchQARequest, UpdateQARequest, response
+from src.models import (
+    QuestionRequest, CreateSessionRequest,
+    AddQARequest, SearchQARequest, UpdateQARequest, response,
+)
 
 # --- Logger Setup ---
 logging.basicConfig(
@@ -36,9 +50,9 @@ logger = logging.getLogger(__name__)
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Simplified RAG API",
-    description="Core functions for RAG document processing and Q&A (direct PDF upload)",
-    version="2.0.0"
+    title="Simplified RAG API (Multi-Tenant)",
+    description="Multi-tenant RAG API — each tenant is isolated via Pinecone namespaces",
+    version="3.0.0"
 )
 
 # Mangum adapter for AWS Lambda
@@ -78,15 +92,17 @@ async def root():
 @app.post("/insert-doc-vector-db", response_model=response)
 async def insert_doc_vector_db(
     background_tasks: BackgroundTasks,
+    entity_id: str = Form(...),
     doc_id: str = Form(...),
     file: UploadFile = File(...),
 ):
     """
-    Upload a PDF and add its Q&A pairs to the vector database.
+    Upload a PDF and add its Q&A pairs to a tenant's namespace.
 
+    - `entity_id` — tenant namespace (e.g. "qorpy-business")
     - Accepts a PDF file directly (no S3).
     - Parses Q&A pairs from the PDF.
-    - Generates embeddings and upserts to Pinecone.
+    - Generates embeddings and upserts to Pinecone in the tenant's namespace.
     - Runs in the background.
     """
     try:
@@ -118,10 +134,11 @@ async def insert_doc_vector_db(
 
         def background_update():
             try:
-                logger.info(f"Starting background add for doc_id: {doc_id}")
+                logger.info(f"Starting background add for doc_id: {doc_id} in namespace: {entity_id}")
                 result = rag_system.add_to_existing_collection(
                     file_bytes=file_bytes,
-                    filename=file.filename
+                    filename=file.filename,
+                    namespace=entity_id,
                 )
                 if result.get('success'):
                     tasks[task_id]["status"] = "done"
@@ -142,6 +159,7 @@ async def insert_doc_vector_db(
             "responseCode": "00",
             "responseMessage": f"Background task started to process '{doc_id}'.",
             "data": {
+                "entity_id": entity_id,
                 "doc_id": doc_id,
                 "task_id": task_id,
                 "file_size_mb": round(file_size_mb, 2),
@@ -159,12 +177,13 @@ async def insert_doc_vector_db(
 @app.post("/replace-document-vectors", response_model=response)
 async def replace_document_vectors_endpoint(
     background_tasks: BackgroundTasks,
+    entity_id: str = Form(...),
     doc_id: str = Form(...),
     confirm: str = Form(...),
     file: UploadFile = File(...),
 ):
     """
-    Replace vectors for a specific document.
+    Replace vectors for a specific document within a tenant namespace.
     Upload new PDF, delete old vectors matching doc_id, and re-index.
     Requires confirm="YES".
     """
@@ -200,10 +219,11 @@ async def replace_document_vectors_endpoint(
 
         def background_replace():
             try:
-                logger.info(f"Starting background replace for {doc_id}")
+                logger.info(f"Starting background replace for {doc_id} in namespace: {entity_id}")
                 result = rag_system.replace_specific_document_vectors(
                     file_bytes=file_bytes,
-                    filename=file.filename
+                    filename=file.filename,
+                    namespace=entity_id,
                 )
                 if result.get('success'):
                     tasks[task_id]["status"] = "done"
@@ -223,6 +243,7 @@ async def replace_document_vectors_endpoint(
             "responseCode": "00",
             "responseMessage": "Document vector replacement started",
             "data": {
+                "entity_id": entity_id,
                 "doc_id": doc_id,
                 "task_id": task_id,
             }
@@ -238,10 +259,12 @@ async def replace_document_vectors_endpoint(
 
 @app.post("/reset-vector-db", response_model=response)
 async def reset_vector_db(
-    confirm: str = Form(...)
+    entity_id: str = Form(...),
+    confirm: str = Form(...),
 ):
     """
-    Reset (wipe) the entire vector database.
+    Reset (wipe) all vectors in a specific tenant namespace.
+    Does NOT affect other tenants.
     Requires confirm="YES".
     """
     try:
@@ -257,11 +280,11 @@ async def reset_vector_db(
                 "responseMessage": "Must confirm with 'YES' to reset the vector database"
             }
 
-        result = rag_system.reset_vector_database()
+        result = rag_system.reset_vector_database(namespace=entity_id)
 
         return {
             "responseCode": "00",
-            "responseMessage": "Vector database reset successfully",
+            "responseMessage": f"Namespace '{entity_id}' reset successfully",
             "data": result
         }
 
@@ -275,7 +298,11 @@ async def reset_vector_db(
 
 @app.get("/stats", response_model=response)
 async def get_stats():
-    """Retrieve vector database statistics and document list."""
+    """
+    Retrieve vector database statistics.
+    Returns a breakdown of all namespaces (entity_ids) automatically.
+    No parameters required.
+    """
     try:
         if not rag_system:
             return {
@@ -283,22 +310,63 @@ async def get_stats():
                 "responseMessage": "RAG system not initialized"
             }
 
-        stats = rag_system.get_database_stats()
-        documents = rag_system.list_all_documents()
-        logger.info(f"Fetched stats successfully: {stats}")
+        # Always pull global stats — Pinecone returns per-namespace counts automatically
+        raw_stats = rag_system.index.describe_index_stats()
+        logger.info(f"Fetched stats successfully: {raw_stats}")
+
+        namespaces = raw_stats.get("namespaces", {})
+        entity_ids = {
+            ns: {"vector_count": info.get("vector_count", 0)}
+            for ns, info in namespaces.items()
+        }
 
         return {
             "responseCode": "00",
             "responseMessage": "Database statistics fetched successfully",
             "data": {
-                "stats": stats,
-                "document_count": len(documents),
-                "documents": documents
+                "total_vectors": raw_stats.get("total_vector_count", 0),
+                "index_name": rag_system.index_name,
+                "dimension": raw_stats.get("dimension", 512),
+                "entity_ids": entity_ids,
             }
         }
 
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
+        return {
+            "responseCode": "01",
+            "responseMessage": f"Failed: {str(e)}"
+        }
+
+
+@app.get("/entities", response_model=response)
+async def list_entities():
+    """
+    List all known namespaces (entity_ids) from the Pinecone index.
+    Useful for recovery — if a client forgets their entity_id.
+    """
+    try:
+        if not rag_system:
+            return {
+                "responseCode": "01",
+                "responseMessage": "RAG system not initialized"
+            }
+
+        stats = rag_system.index.describe_index_stats()
+        namespaces = list(stats.get("namespaces", {}).keys())
+        logger.info(f"Found {len(namespaces)} namespaces: {namespaces}")
+
+        return {
+            "responseCode": "00",
+            "responseMessage": f"Found {len(namespaces)} entities",
+            "data": {
+                "entities": namespaces,
+                "count": len(namespaces),
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing entities: {e}")
         return {
             "responseCode": "01",
             "responseMessage": f"Failed: {str(e)}"
@@ -326,12 +394,13 @@ async def task_status(task_id: str):
 
 
 @app.post("/create-session", response_model=response)
-async def create_session():
+async def create_session(request: CreateSessionRequest):
     """
     Generate a new session ID for conversation history.
-    Clients should call this once at the start of a conversation,
-    then pass the returned session_id with every /ask-question request.
+    Clients must pass entity_id to scope the session.
+    Returns only the session_id (frontend already has entity_id).
     """
+    logger.info(f"Creating session for entity_id: {request.entity_id}")
     session_id = str(uuid.uuid4())
     return {
         "responseCode": "00",
@@ -346,7 +415,7 @@ async def create_session():
 async def ask_question_stream(request: QuestionRequest):
     """
     Stream an answer token by token using Server-Sent Events (SSE).
-    The client receives `data: {"text": "..."}\n\n` chunks, then `data: [DONE]\n\n`.
+    The client receives `data: {"text": "..."}\\n\\n` chunks, then `data: [DONE]\\n\\n`.
     """
     if not rag_system:
         async def error_gen():
@@ -356,7 +425,7 @@ async def ask_question_stream(request: QuestionRequest):
 
     def generate():
         try:
-            logger.info(f"Streaming question: '{request.question[:50]}...'")
+            logger.info(f"Streaming question: '{request.question[:50]}...' for entity: {request.entity_id}")
             for text_chunk in rag_system.ask_questions_stream(question=request.question):
                 if text_chunk:
                     yield f"data: {json.dumps({'text': text_chunk})}\n\n"
@@ -376,7 +445,7 @@ async def ask_question_stream(request: QuestionRequest):
 @app.post("/ask-question", response_model=response)
 async def ask_question(request: QuestionRequest):
     """
-    Ask a question with RAG retrieval.
+    Ask a question with RAG retrieval, scoped to the tenant's namespace.
     Uses sub-query decomposition internally for better results.
     """
     try:
@@ -386,8 +455,12 @@ async def ask_question(request: QuestionRequest):
                 "responseMessage": "RAG system not initialized"
             }
 
-        logger.info(f"Processing question: '{request.question[:50]}...'")
-        result = rag_system.ask_questions(question=request.question, session_id=request.session_id)
+        logger.info(f"Processing question: '{request.question[:50]}...' for entity: {request.entity_id}")
+        result = rag_system.ask_questions(
+            question=request.question,
+            session_id=request.session_id,
+            namespace=request.entity_id,
+        )
 
         if result.get("success"):
             logger.info("Successfully answered question.")
@@ -431,7 +504,7 @@ async def ask_question(request: QuestionRequest):
 
 @app.post("/add-qa", response_model=response)
 async def add_qa(request: AddQARequest):
-    """Add a single Q&A pair to the vector database."""
+    """Add a single Q&A pair to a tenant's namespace."""
     try:
         if not rag_system:
             return {"responseCode": "01", "responseMessage": "RAG system not initialized"}
@@ -441,6 +514,7 @@ async def add_qa(request: AddQARequest):
             answer=request.answer,
             category=request.category or "General",
             section=request.section or "General",
+            namespace=request.entity_id,
         )
         if result.get("success"):
             return {
@@ -456,12 +530,16 @@ async def add_qa(request: AddQARequest):
 
 @app.post("/search-qa", response_model=response)
 async def search_qa(request: SearchQARequest):
-    """Search existing Q&A pairs by semantic similarity."""
+    """Search existing Q&A pairs by semantic similarity within a tenant's namespace."""
     try:
         if not rag_system:
             return {"responseCode": "01", "responseMessage": "RAG system not initialized"}
 
-        matches = rag_system.search_qa(query=request.query, top_k=request.top_k or 3)
+        matches = rag_system.search_qa(
+            query=request.query,
+            top_k=request.top_k or 3,
+            namespace=request.entity_id,
+        )
         return {
             "responseCode": "00",
             "responseMessage": f"Found {len(matches)} results",
@@ -474,7 +552,7 @@ async def search_qa(request: SearchQARequest):
 
 @app.post("/update-qa", response_model=response)
 async def update_qa(request: UpdateQARequest):
-    """Update an existing Q&A pair in the vector database."""
+    """Update an existing Q&A pair within a tenant's namespace."""
     try:
         if not rag_system:
             return {"responseCode": "01", "responseMessage": "RAG system not initialized"}
@@ -483,6 +561,7 @@ async def update_qa(request: UpdateQARequest):
             vector_id=request.vector_id,
             new_answer=request.new_answer,
             new_question=request.new_question,
+            namespace=request.entity_id,
         )
         if result.get("success"):
             return {
@@ -499,11 +578,12 @@ async def update_qa(request: UpdateQARequest):
 @app.post("/bulk-add-qa", response_model=response)
 async def bulk_add_qa(
     file: UploadFile = File(...),
+    entity_id: str = Form(...),
     category: str = Form("General"),
     section: str = Form("General"),
 ):
     """
-    Bulk-add Q&A pairs from an Excel file (.xlsx).
+    Bulk-add Q&A pairs from an Excel file (.xlsx) to a tenant's namespace.
     The file must have two columns: Question (col A) and Answer (col B).
     """
     try:
@@ -531,7 +611,12 @@ async def bulk_add_qa(
         if not qa_pairs:
             return {"responseCode": "01", "responseMessage": "No valid Q&A pairs found in the Excel file"}
 
-        result = rag_system.bulk_add_qa(qa_pairs, category=category, section=section)
+        result = rag_system.bulk_add_qa(
+            qa_pairs,
+            category=category,
+            section=section,
+            namespace=entity_id,
+        )
         if result.get("success"):
             return {
                 "responseCode": "00",

@@ -15,7 +15,11 @@ from io import BytesIO
 
 LAMBDA_URL = "https://gij3liro3kouweizzludyyhbe40dsxcw.lambda-url.us-east-1.on.aws"
 LOCAL_URL = "http://localhost:8000"
-API_URL = LAMBDA_URL
+API_URL = LOCAL_URL
+
+# Tenant identity — same entity_id as the main chat app
+# For the admin panel, we grab it from the URL or local state.
+ENTITY_ID = st.query_params.get("entity_id", "default-tenant")
 
 st.set_page_config(
     page_title="Qorpy Admin",
@@ -63,6 +67,7 @@ with tab_add:
                     resp = requests.post(
                         f"{API_URL}/add-qa",
                         json={
+                            "entity_id": ENTITY_ID,
                             "question": qa_question.strip(),
                             "answer": qa_answer.strip(),
                             "category": qa_category.strip(),
@@ -103,7 +108,7 @@ with tab_search:
             try:
                 resp = requests.post(
                     f"{API_URL}/search-qa",
-                    json={"query": search_query.strip(), "top_k": 3},
+                    json={"entity_id": ENTITY_ID, "query": search_query.strip(), "top_k": 3},
                     timeout=30,
                 )
                 data = resp.json()
@@ -143,6 +148,7 @@ with tab_search:
                 with st.spinner("Re-embedding and saving…"):
                     try:
                         payload = {
+                            "entity_id": ENTITY_ID,
                             "vector_id": match["id"],
                             "new_answer": new_a.strip(),
                         }
@@ -216,7 +222,7 @@ with tab_bulk:
         with st.spinner("Uploading & embedding all Q&A pairs…"):
             try:
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
-                form_data = {"category": bulk_category.strip(), "section": bulk_section.strip()}
+                form_data = {"entity_id": ENTITY_ID, "category": bulk_category.strip(), "section": bulk_section.strip()}
                 resp = requests.post(
                     f"{API_URL}/bulk-add-qa",
                     files=files,

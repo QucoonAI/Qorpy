@@ -313,7 +313,7 @@ class SimplifiedRAG:
         return embeddings
     
     def _upload_to_pinecone(self, chunks: List[Dict], embeddings: List[List[float]], 
-                            document_id: str, filename: str) -> Dict[str, Any]:
+                            document_id: str, filename: str, namespace: str = "") -> Dict[str, Any]:
         """Upload chunks and embeddings to Pinecone with rich metadata"""
         try:
             vectors = []
@@ -354,7 +354,7 @@ class SimplifiedRAG:
             
             for i in range(0, len(vectors), batch_size):
                 batch = vectors[i:i + batch_size]
-                self.index.upsert(vectors=batch)  # Upsert batch to Pinecone
+                self.index.upsert(vectors=batch, namespace=namespace)  # Upsert batch to Pinecone
                 total_uploaded += len(batch)
             
             logger.info(f"Successfully uploaded {total_uploaded} vectors to Pinecone.")
@@ -373,7 +373,7 @@ class SimplifiedRAG:
     # CORE FUNCTIONS
     # =========================
 
-    def process_document(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+    def process_document(self, file_bytes: bytes, filename: str, namespace: str = "") -> Dict[str, Any]:
         """
         Complete PDF Processing Pipeline (from bytes).
         PDF bytes -> Q&A Chunks -> Embeddings -> Pinecone
@@ -403,7 +403,7 @@ class SimplifiedRAG:
 
             # Step 4: Upload to Pinecone
             logger.info("Uploading to Pinecone...")
-            upload_result = self._upload_to_pinecone(chunks, embeddings, document_id, filename)
+            upload_result = self._upload_to_pinecone(chunks, embeddings, document_id, filename, namespace=namespace)
 
             processing_time = time.time() - start_time
             total_tokens = sum(chunk['token_count'] for chunk in chunks)
@@ -437,22 +437,24 @@ class SimplifiedRAG:
             }
 
 
-    def add_to_existing_collection(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+    def add_to_existing_collection(self, file_bytes: bytes, filename: str, namespace: str = "") -> Dict[str, Any]:
         """Add a document to the existing Pinecone collection without removing anything."""
         logger.info(f"Adding document '{filename}' to existing collection...")
 
         try:
             stats = self.index.describe_index_stats()
-            initial_vector_count = stats['total_vector_count']
-            logger.info(f"Collection has {initial_vector_count} vectors before adding.")
+            ns_stats = stats.get('namespaces', {}).get(namespace, {})
+            initial_vector_count = ns_stats.get('vector_count', 0)
+            logger.info(f"Namespace '{namespace}' has {initial_vector_count} vectors before adding.")
 
-            result = self.process_document(file_bytes, filename)
+            result = self.process_document(file_bytes, filename, namespace=namespace)
 
             if result['success']:
                 new_stats = self.index.describe_index_stats()
+                new_ns_stats = new_stats.get('namespaces', {}).get(namespace, {})
                 result['collection_info'] = {
                     'total_vectors_before': initial_vector_count,
-                    'total_vectors_after': new_stats['total_vector_count'],
+                    'total_vectors_after': new_ns_stats.get('vector_count', 0),
                     'vectors_added': result.get('pinecone_vectors_uploaded', 0)
                 }
                 logger.info(f"Document added! Collection now has {new_stats['total_vector_count']} total vectors.")
@@ -466,15 +468,15 @@ class SimplifiedRAG:
             return {'success': False, 'error': str(e)}
 
 
-    def replace_specific_document_vectors(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+    def replace_specific_document_vectors(self, file_bytes: bytes, filename: str, namespace: str = "") -> Dict[str, Any]:
         """Replace all vectors for a specific document (delete old, upload new)."""
         logger.info(f"Replacing vectors for document: {filename}")
 
         try:
-            self.index.delete(filter={"filename": {"$eq": filename}})
+            self.index.delete(filter={"filename": {"$eq": filename}}, namespace=namespace)
             logger.info(f"Deleted existing vectors for {filename}.")
 
-            result = self.process_document(file_bytes, filename)
+            result = self.process_document(file_bytes, filename, namespace=namespace)
 
             if result.get('success'):
                 result['document_replacement_info'] = {
@@ -499,27 +501,33 @@ class SimplifiedRAG:
             }
 
 
-    def reset_vector_database(self) -> Dict[str, Any]:
+    def reset_vector_database(self, namespace: str = "") -> Dict[str, Any]:
         """
-        Empty Entire Database
-        
-        Deletes ALL existing documents.
-        Use with caution - this wipes everything!
+        Delete all vectors in a specific namespace (tenant).
+        Does NOT wipe other tenants' data.
             
         Returns:
             Dict with processing results
         """
-        logger.info(f"Deleting entire database")
+        logger.info(f"Deleting all vectors in namespace '{namespace}'")
         
         try:
             # Get current stats before deleting
             initial_stats = self.index.describe_index_stats()
-            initial_count = initial_stats['total_vector_count']
+            ns_stats = initial_stats.get('namespaces', {}).get(namespace, {})
+            initial_count = ns_stats.get('vector_count', 0)
             
-            logger.warning(f"Deleting {initial_count} existing vectors...")
+            logger.warning(f"Deleting {initial_count} existing vectors in namespace '{namespace}'...")
             
-            # Delete all existing vectors
-            self.index.delete(delete_all=True)
+            # Delete all vectors in the specified namespace only
+            try:
+                self.index.delete(delete_all=True, namespace=namespace)
+            except Exception as e:
+                # If Pinecone throws "Namespace not found", it's already empty!
+                if "Namespace not found" in str(e) or "404" in str(e):
+                    logger.info(f"Namespace {namespace} is already empty (404).")
+                else:
+                    raise e
             
             logger.info("Database cleared!")
                        
@@ -579,7 +587,7 @@ class SimplifiedRAG:
         # Fallback: use original question as single query
         return [question]
 
-    def ask_questions(self, question: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+    def ask_questions(self, question: str, session_id: Optional[str] = None, namespace: str = "") -> Dict[str, Any]:
         """
         Ask a question with RAG retrieval using sub-query decomposition.
         Optionally maintains conversation history per session via Redis.
@@ -626,7 +634,7 @@ class SimplifiedRAG:
                 embedding = self._generate_embeddings([sq])[0]
                 logger.info(f"[TIMING] Step 2.{idx+1}a - Embedding sub-query {idx+1}: {time.time()-t2:.2f}s")
                 t3 = time.time()
-                results = self.index.query(vector=embedding, top_k=top_k, include_metadata=True)
+                results = self.index.query(vector=embedding, top_k=top_k, include_metadata=True, namespace=namespace)
                 logger.info(f"[TIMING] Step 2.{idx+1}b - Pinecone query {idx+1}: {time.time()-t3:.2f}s | hits: {len(results['matches'])}")
                 return results['matches']
 
@@ -748,6 +756,7 @@ class SimplifiedRAG:
         answer: str,
         category: str = "General",
         section: str = "General",
+        namespace: str = "",
     ) -> Dict[str, Any]:
         """Add a single Q&A pair to Pinecone."""
         try:
@@ -765,18 +774,18 @@ class SimplifiedRAG:
                 "chunk_index": 0,
             }
             embedding = self._generate_embeddings([chunk_text])[0]
-            result = self._upload_to_pinecone([chunk], [embedding], doc_id, "manual_entry")
+            result = self._upload_to_pinecone([chunk], [embedding], doc_id, "manual_entry", namespace=namespace)
             logger.info(f"[ADMIN] Added Q&A pair (doc_id={doc_id})")
             return {"success": True, "document_id": doc_id, **result}
         except Exception as e:
             logger.error(f"[ADMIN] Failed to add Q&A: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-    def search_qa(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    def search_qa(self, query: str, top_k: int = 3, namespace: str = "") -> List[Dict[str, Any]]:
         """Search existing Q&A pairs by semantic similarity. Returns top_k results with vector IDs."""
         try:
             embedding = self._generate_embeddings([query])[0]
-            results = self.index.query(vector=embedding, top_k=top_k, include_metadata=True)
+            results = self.index.query(vector=embedding, top_k=top_k, include_metadata=True, namespace=namespace)
             matches = []
             for m in results["matches"]:
                 matches.append({
@@ -795,14 +804,14 @@ class SimplifiedRAG:
             logger.error(f"[ADMIN] search_qa failed: {e}", exc_info=True)
             return []
 
-    def update_qa(self, vector_id: str, new_answer: str, new_question: str | None = None) -> Dict[str, Any]:
+    def update_qa(self, vector_id: str, new_answer: str, new_question: str | None = None, namespace: str = "") -> Dict[str, Any]:
         """
         Update an existing Q&A vector in Pinecone.
         Re-embeds with new text and upserts.
         """
         try:
             # Fetch current vector metadata
-            fetch_result = self.index.fetch(ids=[vector_id])
+            fetch_result = self.index.fetch(ids=[vector_id], namespace=namespace)
             if vector_id not in fetch_result["vectors"]:
                 return {"success": False, "error": f"Vector {vector_id} not found"}
 
@@ -825,14 +834,14 @@ class SimplifiedRAG:
             updated_meta["char_count"] = len(chunk_text)
             updated_meta["updated_at"] = datetime.now().isoformat()
 
-            self.index.upsert(vectors=[{"id": vector_id, "values": embedding, "metadata": updated_meta}])
+            self.index.upsert(vectors=[{"id": vector_id, "values": embedding, "metadata": updated_meta}], namespace=namespace)
             logger.info(f"[ADMIN] Updated vector {vector_id}")
             return {"success": True, "vector_id": vector_id}
         except Exception as e:
             logger.error(f"[ADMIN] update_qa failed for {vector_id}: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-    def bulk_add_qa(self, qa_pairs: List[Dict[str, str]], category: str = "General", section: str = "General") -> Dict[str, Any]:
+    def bulk_add_qa(self, qa_pairs: List[Dict[str, str]], category: str = "General", section: str = "General", namespace: str = "") -> Dict[str, Any]:
         """
         Bulk-add a list of Q&A pairs.
         Each item in qa_pairs must have 'question' and 'answer' keys.
@@ -858,7 +867,7 @@ class SimplifiedRAG:
 
             texts = [c["text"] for c in chunks]
             embeddings = self._generate_embeddings(texts)
-            result = self._upload_to_pinecone(chunks, embeddings, doc_id, "bulk_upload")
+            result = self._upload_to_pinecone(chunks, embeddings, doc_id, "bulk_upload", namespace=namespace)
             logger.info(f"[ADMIN] Bulk-added {len(chunks)} Q&A pairs (doc_id={doc_id})")
             return {"success": True, "document_id": doc_id, "pairs_added": len(chunks), **result}
         except Exception as e:
@@ -868,32 +877,41 @@ class SimplifiedRAG:
     # =================
     # UTILITY FUNCTIONS
     # =================
-    def get_database_stats(self) -> Dict[str, Any]:
-        """Get current database statistics"""
+    def get_database_stats(self, namespace: str | None = None) -> Dict[str, Any]:
+        """Get database statistics. If namespace is given, return stats for that tenant only."""
         try:
-            # Get stats directly from Pinecone index
             stats = self.index.describe_index_stats()
             logger.info(f"Retrieved DB stats: {stats}")
+
+            if namespace is not None:
+                ns_stats = stats.get('namespaces', {}).get(namespace, {})
+                return {
+                    'namespace': namespace,
+                    'total_vectors': ns_stats.get('vector_count', 0),
+                    'index_name': self.index_name,
+                }
+
+            # No namespace specified — return global overview with all namespaces
             return {
                 'total_vectors': stats['total_vector_count'],
-                'index_fullness': stats.get('index_fullness', 0), # Serverless may not have this
-                'dimension': stats.get('dimension', 512), # Get dimension if available
-                'index_name': self.index_name
+                'index_fullness': stats.get('index_fullness', 0),
+                'dimension': stats.get('dimension', 512),
+                'index_name': self.index_name,
+                'namespaces': {ns: info for ns, info in stats.get('namespaces', {}).items()},
             }
         except Exception as e:
             logger.error(f"Failed to get database stats: {e}", exc_info=True)
             return {'error': str(e)}
     
-    def list_all_documents(self) -> List[Dict[str, Any]]:
-        """List all documents in the database with metadata"""
+    def list_all_documents(self, namespace: str = "") -> List[Dict[str, Any]]:
+        """List all documents in a specific namespace"""
         try:
-            logger.info("Listing all documents... (uses dummy query)")
-            # Query with a dummy vector to get a sample of vectors
-            # This is a workaround as Pinecone doesn't have a "list all" metadata API
+            logger.info(f"Listing documents in namespace '{namespace}'... (uses dummy query)")
             sample_results = self.index.query(
-                vector=[0.0] * 512,  # Dummy vector
-                top_k=1000,  # Get many results to find all documents
-                include_metadata=True
+                vector=[0.0] * 512,
+                top_k=1000,
+                include_metadata=True,
+                namespace=namespace,
             )
             
             # Group by document_id to aggregate document info
